@@ -109,13 +109,17 @@ pub async fn get_or_create_db_pool(
     Ok(pool)
 }
 
-/// Add a new connection, test it, and store credentials.
+/// Add a new connection and store credentials.
+/// Always saves the connection; creates a pool only if reachable.
 #[tauri::command]
 pub async fn add_connection(
     state: State<'_, AppState>,
     config: ConnectionConfig,
     password: String,
 ) -> Result<(), AppError> {
+    store_password(&config.id, &password)?;
+
+    // Try to connect — save the connection regardless of outcome
     let conn_str = build_connection_string(
         &config.host,
         config.port,
@@ -124,13 +128,12 @@ pub async fn add_connection(
         &config.database,
         config.ssl,
     );
-    let pool = postgres::create_pool(&conn_str).await?;
-    postgres::test_connection(&pool).await?;
-
-    store_password(&config.id, &password)?;
-
-    let mut pools = state.pools.lock().await;
-    pools.insert(config.id.clone(), pool);
+    if let Ok(pool) = postgres::create_pool(&conn_str).await {
+        if postgres::test_connection(&pool).await.is_ok() {
+            let mut pools = state.pools.lock().await;
+            pools.insert(config.id.clone(), pool);
+        }
+    }
 
     let mut connections = state.connections.lock().await;
     connections.push(config);
@@ -325,25 +328,7 @@ pub async fn load_config_connections(
 
         let id = uuid::Uuid::new_v4().to_string();
 
-        let conn_str = build_connection_string(
-            &file_config.host,
-            file_config.port,
-            &file_config.user,
-            &file_config.password,
-            &file_config.database,
-            file_config.ssl,
-        );
-
-        // Try to connect — skip if it fails (don't block other connections)
-        let pool = match postgres::create_pool(&conn_str).await {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if postgres::test_connection(&pool).await.is_err() {
-            continue;
-        }
-
-        // Store password in keychain
+        // Store password in keychain (must succeed to be useful)
         if store_password(&id, &file_config.password).is_err() {
             continue;
         }
@@ -358,9 +343,21 @@ pub async fn load_config_connections(
             ssl: file_config.ssl,
         };
 
-        let mut pools = state.pools.lock().await;
-        pools.insert(id, pool);
-        drop(pools);
+        // Create a lazy pool — doesn't actually connect until first query.
+        // This ensures the connection always appears in the sidebar instantly.
+        let conn_str = build_connection_string(
+            &config.host,
+            config.port,
+            &config.user,
+            &file_config.password,
+            &config.database,
+            config.ssl,
+        );
+        if let Ok(pool) = postgres::create_pool_lazy(&conn_str) {
+            let mut pools = state.pools.lock().await;
+            pools.insert(id, pool);
+            drop(pools);
+        }
 
         let mut connections = state.connections.lock().await;
         connections.push(config.clone());

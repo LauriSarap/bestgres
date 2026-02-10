@@ -14,6 +14,8 @@ import {
   Loader2,
   Pencil,
   HardDrive,
+  AlertCircle,
+  RefreshCw,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ConnectionEntry, SchemaObject } from "@/types";
@@ -51,11 +53,13 @@ export function Sidebar({
   const [expandedDatabases, setExpandedDatabases] = useState<Set<string>>(new Set());
   const [loadingConn, setLoadingConn] = useState<string | null>(null);
   const [loadingDb, setLoadingDb] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  // Per-connection errors
+  const [connErrors, setConnErrors] = useState<Record<string, string>>({});
 
   const toggleConnection = useCallback(
     async (connId: string) => {
-      if (expandedConnections.has(connId)) {
+      // If already expanded and no error, collapse it
+      if (expandedConnections.has(connId) && !connErrors[connId]) {
         setExpandedConnections((prev) => {
           const next = new Set(prev);
           next.delete(connId);
@@ -67,20 +71,26 @@ export function Sidebar({
       onSelectConnection(connId);
       setExpandedConnections((prev) => new Set(prev).add(connId));
 
-      if (!databases[connId]) {
-        setLoadingConn(connId);
-        setError(null);
-        try {
-          const dbs = await invoke<string[]>("list_databases", { connectionId: connId });
-          setDatabases((prev) => ({ ...prev, [connId]: dbs }));
-        } catch (err) {
-          setError(String(err));
-        } finally {
-          setLoadingConn(null);
-        }
+      // Always retry if there was an error, otherwise skip if already loaded
+      if (databases[connId] && !connErrors[connId]) return;
+
+      setLoadingConn(connId);
+      setConnErrors((prev) => {
+        const next = { ...prev };
+        delete next[connId];
+        return next;
+      });
+
+      try {
+        const dbs = await invoke<string[]>("list_databases", { connectionId: connId });
+        setDatabases((prev) => ({ ...prev, [connId]: dbs }));
+      } catch (err) {
+        setConnErrors((prev) => ({ ...prev, [connId]: String(err) }));
+      } finally {
+        setLoadingConn(null);
       }
     },
-    [expandedConnections, databases, onSelectConnection]
+    [expandedConnections, databases, connErrors, onSelectConnection]
   );
 
   const toggleDatabase = useCallback(
@@ -100,7 +110,6 @@ export function Sidebar({
 
       if (!schemas[key]) {
         setLoadingDb(key);
-        setError(null);
         try {
           const objects = await invoke<SchemaObject[]>("get_schema", {
             connectionId: connId,
@@ -108,7 +117,7 @@ export function Sidebar({
           });
           setSchemas((prev) => ({ ...prev, [key]: objects }));
         } catch (err) {
-          setError(String(err));
+          setConnErrors((prev) => ({ ...prev, [key]: String(err) }));
         } finally {
           setLoadingDb(null);
         }
@@ -162,6 +171,7 @@ export function Sidebar({
           connections.map((conn) => {
             const isExpanded = expandedConnections.has(conn.id);
             const isLoadingConn = loadingConn === conn.id;
+            const connError = connErrors[conn.id];
             const dbs = databases[conn.id] || [];
 
             return (
@@ -172,13 +182,17 @@ export function Sidebar({
                     onClick={() => toggleConnection(conn.id)}
                     className={cn(
                       "flex flex-1 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs transition-colors",
-                      conn.id === activeConnectionId
-                        ? "bg-primary/10 text-primary font-medium"
-                        : "text-sidebar-foreground hover:bg-accent"
+                      connError
+                        ? "text-destructive hover:bg-destructive/10"
+                        : conn.id === activeConnectionId
+                          ? "bg-primary/10 text-primary font-medium"
+                          : "text-sidebar-foreground hover:bg-accent"
                     )}
                   >
                     {isLoadingConn ? (
                       <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+                    ) : connError ? (
+                      <AlertCircle className="h-3 w-3 shrink-0" />
                     ) : isExpanded ? (
                       <ChevronDown className="h-3 w-3 shrink-0" />
                     ) : (
@@ -199,13 +213,30 @@ export function Sidebar({
                   </button>
                 </div>
 
+                {/* Connection error */}
+                {isExpanded && connError && !isLoadingConn && (
+                  <div className="ml-5 mt-1 mb-1">
+                    <p className="px-2 py-1 text-[10px] text-destructive leading-tight break-words">
+                      {connError}
+                    </p>
+                    <button
+                      onClick={() => toggleConnection(conn.id)}
+                      className="flex items-center gap-1 px-2 py-0.5 text-[10px] text-muted-foreground hover:text-primary transition-colors"
+                    >
+                      <RefreshCw className="h-2.5 w-2.5" />
+                      Retry
+                    </button>
+                  </div>
+                )}
+
                 {/* Databases tree */}
-                {isExpanded && !isLoadingConn && (
+                {isExpanded && !isLoadingConn && !connError && (
                   <div className="ml-3 border-l border-border pl-1.5 mt-0.5">
                     {dbs.map((dbName) => {
                       const dbKey = `${conn.id}:${dbName}`;
                       const isDbExpanded = expandedDatabases.has(dbKey);
                       const isDbLoading = loadingDb === dbKey;
+                      const dbError = connErrors[dbKey];
                       const objects = schemas[dbKey] || [];
                       const tables = objects.filter((o) => o.object_type === "table");
                       const views = objects.filter((o) => o.object_type === "view");
@@ -228,8 +259,17 @@ export function Sidebar({
                             <span className="truncate">{dbName}</span>
                           </button>
 
+                          {/* Database error */}
+                          {isDbExpanded && dbError && !isDbLoading && (
+                            <div className="ml-5 mt-0.5">
+                              <p className="px-2 py-0.5 text-[10px] text-destructive leading-tight break-words">
+                                {dbError}
+                              </p>
+                            </div>
+                          )}
+
                           {/* Schema objects inside this database */}
-                          {isDbExpanded && !isDbLoading && (
+                          {isDbExpanded && !isDbLoading && !dbError && (
                             <div className="ml-3 border-l border-border pl-1.5 mt-0.5">
                               {/* New Query */}
                               <button
@@ -289,11 +329,7 @@ export function Sidebar({
                       );
                     })}
 
-                    {error && conn.id === activeConnectionId && (
-                      <p className="px-2 py-1 text-xs text-destructive">{error}</p>
-                    )}
-
-                    {dbs.length === 0 && !error && (
+                    {dbs.length === 0 && (
                       <p className="px-2 py-1 text-xs text-muted-foreground">
                         No databases found
                       </p>

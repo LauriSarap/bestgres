@@ -1,14 +1,28 @@
+use std::time::Duration;
+
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Column, PgPool, Row};
 
 use crate::models::{AppError, ColumnInfo, QueryResult, SchemaObject, SchemaObjectType};
 
 /// Create a new connection pool for the given connection string.
+/// Eagerly connects and validates the connection.
 pub async fn create_pool(connection_string: &str) -> Result<PgPool, AppError> {
     PgPoolOptions::new()
         .max_connections(5)
+        .acquire_timeout(Duration::from_secs(5))
         .connect(connection_string)
         .await
+        .map_err(|e| AppError::Connection(e.to_string()))
+}
+
+/// Create a lazy connection pool that only connects when first used.
+/// Uses a short acquire timeout so unreachable hosts fail fast.
+pub fn create_pool_lazy(connection_string: &str) -> Result<PgPool, AppError> {
+    PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_lazy(connection_string)
         .map_err(|e| AppError::Connection(e.to_string()))
 }
 
