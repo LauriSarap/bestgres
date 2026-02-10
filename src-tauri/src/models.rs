@@ -15,7 +15,7 @@ pub struct ConnectionConfig {
 
 /// Config format for JSON files in ~/.config/bestgres/connections/.
 /// Includes password directly (unlike ConnectionConfig which uses keychain).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionFileConfig {
     pub name: String,
     pub host: String,
@@ -50,6 +50,51 @@ pub struct ColumnInfo {
     pub data_type: String,
     pub is_nullable: bool,
     pub is_primary_key: bool,
+}
+
+/// Detailed column info for DDL/structure view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnDetail {
+    pub name: String,
+    pub data_type: String,
+    pub is_nullable: bool,
+    pub default_value: Option<String>,
+}
+
+/// Index info for structure view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexInfo {
+    pub name: String,
+    pub is_unique: bool,
+    pub is_primary: bool,
+    pub definition: String,
+}
+
+/// Constraint info for structure view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstraintInfo {
+    pub name: String,
+    pub constraint_type: String,
+    pub definition: String,
+}
+
+/// Foreign key info for structure view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForeignKeyInfo {
+    pub name: String,
+    pub column_name: String,
+    pub ref_schema: String,
+    pub ref_table: String,
+    pub ref_column: String,
+}
+
+/// Full table structure for the DDL view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableStructure {
+    pub columns: Vec<ColumnDetail>,
+    pub indexes: Vec<IndexInfo>,
+    pub constraints: Vec<ConstraintInfo>,
+    pub foreign_keys: Vec<ForeignKeyInfo>,
 }
 
 /// Result of executing a query — column names + rows of string values.

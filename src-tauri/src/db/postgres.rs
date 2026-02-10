@@ -131,6 +131,195 @@ pub async fn get_columns(
     Ok(columns)
 }
 
+/// Get the full DDL and structure info for a table.
+/// Returns: (columns, indexes, constraints, foreign_keys) as structured data.
+pub async fn get_table_structure(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+) -> Result<crate::models::TableStructure, AppError> {
+    use crate::models::{ColumnDetail, IndexInfo, ConstraintInfo, ForeignKeyInfo};
+
+    // 1. Detailed column info
+    let col_rows = sqlx::query(
+        r#"
+        SELECT
+            c.column_name,
+            c.data_type,
+            c.udt_name,
+            c.character_maximum_length,
+            c.numeric_precision,
+            c.numeric_scale,
+            c.is_nullable,
+            c.column_default
+        FROM information_schema.columns c
+        WHERE c.table_schema = $1 AND c.table_name = $2
+        ORDER BY c.ordinal_position
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let columns: Vec<ColumnDetail> = col_rows
+        .iter()
+        .map(|row| {
+            let data_type: String = row.get("data_type");
+            let udt_name: String = row.get("udt_name");
+            let char_len: Option<i32> = row.get("character_maximum_length");
+            let num_prec: Option<i32> = row.get("numeric_precision");
+            let num_scale: Option<i32> = row.get("numeric_scale");
+
+            // Build a display type like "varchar(255)" or "numeric(10,2)"
+            let display_type = if data_type == "character varying" {
+                match char_len {
+                    Some(l) => format!("varchar({})", l),
+                    None => "varchar".into(),
+                }
+            } else if data_type == "character" {
+                match char_len {
+                    Some(l) => format!("char({})", l),
+                    None => "char".into(),
+                }
+            } else if data_type == "numeric" {
+                match (num_prec, num_scale) {
+                    (Some(p), Some(s)) => format!("numeric({},{})", p, s),
+                    (Some(p), None) => format!("numeric({})", p),
+                    _ => "numeric".into(),
+                }
+            } else if data_type == "USER-DEFINED" {
+                udt_name.clone()
+            } else if data_type == "ARRAY" {
+                format!("{}[]", udt_name.trim_start_matches('_'))
+            } else {
+                data_type.clone()
+            };
+
+            let nullable: String = row.get("is_nullable");
+            let default_val: Option<String> = row.get("column_default");
+
+            ColumnDetail {
+                name: row.get("column_name"),
+                data_type: display_type,
+                is_nullable: nullable == "YES",
+                default_value: default_val,
+            }
+        })
+        .collect();
+
+    // 2. Indexes
+    let idx_rows = sqlx::query(
+        r#"
+        SELECT
+            i.relname AS index_name,
+            ix.indisunique AS is_unique,
+            ix.indisprimary AS is_primary,
+            pg_get_indexdef(ix.indexrelid) AS definition
+        FROM pg_index ix
+        JOIN pg_class t ON t.oid = ix.indrelid
+        JOIN pg_class i ON i.oid = ix.indexrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE n.nspname = $1 AND t.relname = $2
+        ORDER BY i.relname
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let indexes: Vec<IndexInfo> = idx_rows
+        .iter()
+        .map(|row| IndexInfo {
+            name: row.get("index_name"),
+            is_unique: row.get("is_unique"),
+            is_primary: row.get("is_primary"),
+            definition: row.get("definition"),
+        })
+        .collect();
+
+    // 3. Constraints (CHECK, UNIQUE — excluding PKs and FKs which are shown separately)
+    let con_rows = sqlx::query(
+        r#"
+        SELECT
+            con.conname AS name,
+            CASE con.contype
+                WHEN 'c' THEN 'CHECK'
+                WHEN 'u' THEN 'UNIQUE'
+                WHEN 'x' THEN 'EXCLUSION'
+            END AS constraint_type,
+            pg_get_constraintdef(con.oid) AS definition
+        FROM pg_constraint con
+        JOIN pg_class t ON t.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE n.nspname = $1 AND t.relname = $2
+          AND con.contype IN ('c', 'u', 'x')
+        ORDER BY con.conname
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let constraints: Vec<ConstraintInfo> = con_rows
+        .iter()
+        .map(|row| ConstraintInfo {
+            name: row.get("name"),
+            constraint_type: row.get("constraint_type"),
+            definition: row.get("definition"),
+        })
+        .collect();
+
+    // 4. Foreign keys
+    let fk_rows = sqlx::query(
+        r#"
+        SELECT
+            con.conname AS name,
+            att.attname AS column_name,
+            ref_ns.nspname AS ref_schema,
+            ref_cl.relname AS ref_table,
+            ref_att.attname AS ref_column
+        FROM pg_constraint con
+        JOIN pg_class t ON t.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ANY(con.conkey)
+        JOIN pg_class ref_cl ON ref_cl.oid = con.confrelid
+        JOIN pg_namespace ref_ns ON ref_ns.oid = ref_cl.relnamespace
+        JOIN pg_attribute ref_att ON ref_att.attrelid = con.confrelid AND ref_att.attnum = ANY(con.confkey)
+        WHERE n.nspname = $1 AND t.relname = $2 AND con.contype = 'f'
+        ORDER BY con.conname, att.attnum
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let foreign_keys: Vec<ForeignKeyInfo> = fk_rows
+        .iter()
+        .map(|row| ForeignKeyInfo {
+            name: row.get("name"),
+            column_name: row.get("column_name"),
+            ref_schema: row.get("ref_schema"),
+            ref_table: row.get("ref_table"),
+            ref_column: row.get("ref_column"),
+        })
+        .collect();
+
+    Ok(crate::models::TableStructure {
+        columns,
+        indexes,
+        constraints,
+        foreign_keys,
+    })
+}
+
 /// Execute an arbitrary SQL query and return results as JSON values.
 pub async fn execute_query(pool: &PgPool, sql: &str) -> Result<QueryResult, AppError> {
     let start = std::time::Instant::now();

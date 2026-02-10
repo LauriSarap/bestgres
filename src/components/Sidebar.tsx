@@ -16,6 +16,7 @@ import {
   HardDrive,
   AlertCircle,
   RefreshCw,
+  FileCode,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ConnectionEntry, SchemaObject } from "@/types";
@@ -28,6 +29,7 @@ interface SidebarProps {
   onAddConnection: () => void;
   onEditConnection: (conn: ConnectionEntry) => void;
   onOpenTable: (connectionId: string, database: string, schema: string, table: string) => void;
+  onOpenStructure: (connectionId: string, database: string, schema: string, table: string) => void;
   onOpenQuery: (connectionId: string, database: string) => void;
   theme: "light" | "dark";
   onToggleTheme: () => void;
@@ -41,6 +43,7 @@ export function Sidebar({
   onAddConnection,
   onEditConnection,
   onOpenTable,
+  onOpenStructure,
   onOpenQuery,
   theme,
   onToggleTheme,
@@ -55,6 +58,27 @@ export function Sidebar({
   const [loadingDb, setLoadingDb] = useState<string | null>(null);
   // Per-connection errors
   const [connErrors, setConnErrors] = useState<Record<string, string>>({});
+  // Connection health: true = alive, false = unreachable, undefined = unknown
+  const [health, setHealth] = useState<Record<string, boolean>>({});
+
+  // Check health for all connections on mount and when connections change
+  useEffect(() => {
+    async function checkAll() {
+      for (const conn of connections) {
+        try {
+          const alive = await invoke<boolean>("check_connection", {
+            connectionId: conn.id,
+          });
+          setHealth((prev) => ({ ...prev, [conn.id]: alive }));
+        } catch {
+          setHealth((prev) => ({ ...prev, [conn.id]: false }));
+        }
+      }
+    }
+    if (connections.length > 0) {
+      checkAll();
+    }
+  }, [connections]);
 
   const toggleConnection = useCallback(
     async (connId: string) => {
@@ -84,8 +108,10 @@ export function Sidebar({
       try {
         const dbs = await invoke<string[]>("list_databases", { connectionId: connId });
         setDatabases((prev) => ({ ...prev, [connId]: dbs }));
+        setHealth((prev) => ({ ...prev, [connId]: true }));
       } catch (err) {
         setConnErrors((prev) => ({ ...prev, [connId]: String(err) }));
+        setHealth((prev) => ({ ...prev, [connId]: false }));
       } finally {
         setLoadingConn(null);
       }
@@ -172,6 +198,7 @@ export function Sidebar({
             const isExpanded = expandedConnections.has(conn.id);
             const isLoadingConn = loadingConn === conn.id;
             const connError = connErrors[conn.id];
+            const isAlive = health[conn.id];
             const dbs = databases[conn.id] || [];
 
             return (
@@ -198,7 +225,17 @@ export function Sidebar({
                     ) : (
                       <ChevronRight className="h-3 w-3 shrink-0" />
                     )}
-                    <Database className="h-3.5 w-3.5 shrink-0" />
+                    <span className="relative shrink-0">
+                      <Database className="h-3.5 w-3.5" />
+                      {isAlive !== undefined && (
+                        <span
+                          className={cn(
+                            "absolute -bottom-0.5 -right-0.5 h-1.5 w-1.5 rounded-full border border-sidebar",
+                            isAlive ? "bg-green-500" : "bg-red-500"
+                          )}
+                        />
+                      )}
+                    </span>
                     <span className="truncate">{conn.name}</span>
                   </button>
                   <button
@@ -287,14 +324,22 @@ export function Sidebar({
                                     Tables ({tables.length})
                                   </p>
                                   {tables.map((t) => (
-                                    <button
-                                      key={`${t.schema}.${t.name}`}
-                                      onClick={() => onOpenTable(conn.id, dbName, t.schema, t.name)}
-                                      className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-xs text-sidebar-foreground hover:bg-accent transition-colors"
-                                    >
-                                      <Table className="h-3 w-3 shrink-0 text-muted-foreground" />
-                                      <span className="truncate">{t.name}</span>
-                                    </button>
+                                    <div key={`${t.schema}.${t.name}`} className="group/table flex items-center">
+                                      <button
+                                        onClick={() => onOpenTable(conn.id, dbName, t.schema, t.name)}
+                                        className="flex flex-1 items-center gap-1.5 rounded-md px-2 py-1 text-xs text-sidebar-foreground hover:bg-accent transition-colors"
+                                      >
+                                        <Table className="h-3 w-3 shrink-0 text-muted-foreground" />
+                                        <span className="truncate">{t.name}</span>
+                                      </button>
+                                      <button
+                                        onClick={() => onOpenStructure(conn.id, dbName, t.schema, t.name)}
+                                        className="mr-1 rounded p-0.5 text-muted-foreground opacity-0 hover:bg-accent hover:text-primary group-hover/table:opacity-100 transition-opacity"
+                                        title="View structure"
+                                      >
+                                        <FileCode className="h-3 w-3" />
+                                      </button>
+                                    </div>
                                   ))}
                                 </div>
                               )}

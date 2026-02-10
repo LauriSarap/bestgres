@@ -39,10 +39,11 @@ function App() {
 
   const openTab = useCallback((tab: Tab) => {
     setTabs((prev) => {
-      if (tab.type === "table-browser") {
+      // Deduplicate table-browser and table-structure tabs
+      if (tab.type === "table-browser" || tab.type === "table-structure") {
         const existing = prev.find(
           (t) =>
-            t.type === "table-browser" &&
+            t.type === tab.type &&
             t.connectionId === tab.connectionId &&
             t.database === tab.database &&
             t.schema === tab.schema &&
@@ -194,6 +195,21 @@ function App() {
     [openTab]
   );
 
+  const handleOpenStructure = useCallback(
+    (connectionId: string, database: string, schema: string, table: string) => {
+      openTab({
+        id: crypto.randomUUID(),
+        title: `${table} (structure)`,
+        type: "table-structure",
+        connectionId,
+        database,
+        schema,
+        table,
+      });
+    },
+    [openTab]
+  );
+
   const handleOpenQuery = useCallback(
     (connectionId: string, database: string) => {
       const conn = connections.find((c) => c.id === connectionId);
@@ -217,6 +233,7 @@ function App() {
         onAddConnection={openAddDialog}
         onEditConnection={openEditDialog}
         onOpenTable={handleOpenTable}
+        onOpenStructure={handleOpenStructure}
         onOpenQuery={handleOpenQuery}
         theme={theme}
         onToggleTheme={toggleTheme}

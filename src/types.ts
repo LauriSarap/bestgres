@@ -21,15 +21,55 @@ export interface ColumnInfo {
   is_primary_key: boolean;
 }
 
+/** Detailed column info for DDL view */
+export interface ColumnDetail {
+  name: string;
+  data_type: string;
+  is_nullable: boolean;
+  default_value: string | null;
+}
+
+/** Index info for DDL view */
+export interface IndexInfo {
+  name: string;
+  is_unique: boolean;
+  is_primary: boolean;
+  definition: string;
+}
+
+/** Constraint info for DDL view */
+export interface ConstraintInfo {
+  name: string;
+  constraint_type: string;
+  definition: string;
+}
+
+/** Foreign key info for DDL view */
+export interface ForeignKeyInfo {
+  name: string;
+  column_name: string;
+  ref_schema: string;
+  ref_table: string;
+  ref_column: string;
+}
+
+/** Full table structure for DDL view */
+export interface TableStructure {
+  columns: ColumnDetail[];
+  indexes: IndexInfo[];
+  constraints: ConstraintInfo[];
+  foreign_keys: ForeignKeyInfo[];
+}
+
 /** A tab in the main area */
 export interface Tab {
   id: string;
   title: string;
-  type: "table-browser" | "query-editor";
+  type: "table-browser" | "query-editor" | "table-structure";
   connectionId: string;
   /** Target database on the server */
   database: string;
-  /** For table-browser tabs */
+  /** For table-browser and table-structure tabs */
   schema?: string;
   table?: string;
 }

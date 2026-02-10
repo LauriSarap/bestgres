@@ -33,14 +33,14 @@
 - [x] System keychain password storage (`keyring-rs`)
 - [x] Auto-load connections from `~/.config/bestgres/connections/*.json` on startup
 - [x] Multi-database support — detect all databases on a server, pool reuse per database
-- [ ] **Auto-save connections** — when adding/editing a connection, persist it as a JSON file in `~/.config/bestgres/connections/` so it survives restarts without manual config
-- [ ] **Connection health indicator** — green/red dot in the sidebar showing if a connection is alive
+- [x] Auto-save connections — adding/editing persists as JSON in `~/.config/bestgres/connections/`, removing deletes the file
+- [x] Connection health indicator — green/red dot in sidebar showing if connection is alive
 
 ### Schema Browsing
 - [x] Sidebar tree: Connection > Databases > Tables / Views
 - [x] Column metadata (name, type, nullable, primary key) via `information_schema`
 - [x] Column data types shown as subtitles in table headers
-- [ ] **Table structure / DDL view** — dedicated tab showing full CREATE TABLE DDL, indexes, constraints, foreign keys, and column defaults
+- [x] Table structure / DDL view — dedicated tab showing columns with types/defaults, indexes, constraints, and foreign keys
 
 ### Table Browser
 - [x] Paginated loading (100 rows per page, "Load more" button)
@@ -83,7 +83,7 @@
 
 ### Build & Packaging
 - [x] Tauri v2 build producing deb and rpm bundles
-- [ ] AppImage support (currently broken — `linuxdeploy` issue on Arch)
+- [x] AppImage support — build with `APPIMAGE_EXTRACT_AND_RUN=1 npm run tauri build`
 
 ---
 

@@ -2,7 +2,7 @@ use tauri::State;
 
 use crate::commands::connection::{get_or_create_db_pool, AppState};
 use crate::db::postgres;
-use crate::models::{AppError, ColumnInfo, QueryResult, SchemaObject};
+use crate::models::{AppError, ColumnInfo, QueryResult, SchemaObject, TableStructure};
 
 /// List all databases on the server for a connection.
 #[tauri::command]
@@ -42,6 +42,19 @@ pub async fn get_columns(
 ) -> Result<Vec<ColumnInfo>, AppError> {
     let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
     postgres::get_columns(&pool, &schema, &table).await
+}
+
+/// Get the full structure (DDL info) for a table.
+#[tauri::command]
+pub async fn get_table_structure(
+    state: State<'_, AppState>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    table: String,
+) -> Result<TableStructure, AppError> {
+    let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
+    postgres::get_table_structure(&pool, &schema, &table).await
 }
 
 /// Execute a SQL query against a specific database on a connection.

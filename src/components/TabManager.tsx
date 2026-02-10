@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { X, Table, TerminalSquare } from "lucide-react";
+import { X, Table, TerminalSquare, FileCode } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TableBrowser } from "@/components/TableBrowser";
 import { QueryEditor } from "@/components/QueryEditor";
+import { TableStructureView } from "@/components/TableStructureView";
 import type { Tab } from "@/types";
 
 interface ContextMenu {
@@ -94,6 +95,8 @@ export function TabManager({
             >
               {tab.type === "table-browser" ? (
                 <Table className="h-3 w-3 shrink-0" />
+              ) : tab.type === "table-structure" ? (
+                <FileCode className="h-3 w-3 shrink-0" />
               ) : (
                 <TerminalSquare className="h-3 w-3 shrink-0" />
               )}
@@ -120,6 +123,14 @@ export function TabManager({
           </div>
         ) : activeTab.type === "table-browser" && activeTab.schema && activeTab.table ? (
           <TableBrowser
+            key={activeTab.id}
+            connectionId={activeTab.connectionId}
+            database={activeTab.database}
+            schema={activeTab.schema}
+            table={activeTab.table}
+          />
+        ) : activeTab.type === "table-structure" && activeTab.schema && activeTab.table ? (
+          <TableStructureView
             key={activeTab.id}
             connectionId={activeTab.connectionId}
             database={activeTab.database}

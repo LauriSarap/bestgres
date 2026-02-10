@@ -15,11 +15,13 @@ pub fn run() {
             commands::connection::remove_connection,
             commands::connection::connect,
             commands::connection::disconnect,
+            commands::connection::check_connection,
             commands::connection::list_connections,
             commands::connection::load_config_connections,
             commands::query::list_databases,
             commands::query::get_schema,
             commands::query::get_columns,
+            commands::query::get_table_structure,
             commands::query::execute_query,
         ])
         .run(tauri::generate_context!())

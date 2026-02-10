@@ -8,6 +8,73 @@ use tokio::sync::Mutex;
 use crate::db::postgres;
 use crate::models::{AppError, ConnectionConfig, ConnectionFileConfig};
 
+/// Get the connections config directory path (~/.config/bestgres/connections/).
+fn connections_dir() -> Result<std::path::PathBuf, AppError> {
+    let dir = dirs::config_dir()
+        .ok_or_else(|| AppError::Config("Cannot determine config directory".into()))?
+        .join("bestgres")
+        .join("connections");
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| AppError::Config(format!("Cannot create config dir: {}", e)))?;
+    }
+    Ok(dir)
+}
+
+/// Persist a connection as a JSON file in the config directory.
+/// Filename is derived from the connection name (sanitized).
+fn save_connection_to_file(config: &ConnectionConfig, password: &str) -> Result<(), AppError> {
+    let dir = connections_dir()?;
+    // Sanitize name for filename: lowercase, replace non-alphanumeric with underscore
+    let safe_name: String = config
+        .name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .to_lowercase();
+    let filename = if safe_name.is_empty() {
+        format!("{}.json", &config.id[..8])
+    } else {
+        format!("{}.json", safe_name)
+    };
+    let file_config = ConnectionFileConfig {
+        name: config.name.clone(),
+        host: config.host.clone(),
+        port: config.port,
+        user: config.user.clone(),
+        password: password.to_string(),
+        database: config.database.clone(),
+        ssl: config.ssl,
+    };
+    let json = serde_json::to_string_pretty(&file_config)
+        .map_err(|e| AppError::Config(format!("Cannot serialize config: {}", e)))?;
+    std::fs::write(dir.join(&filename), json)
+        .map_err(|e| AppError::Config(format!("Cannot write config file: {}", e)))?;
+    Ok(())
+}
+
+/// Delete the config file for a connection by trying to match by name.
+fn delete_connection_file(config: &ConnectionConfig) -> Result<(), AppError> {
+    let dir = connections_dir()?;
+    let safe_name: String = config
+        .name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .to_lowercase();
+    let filename = if safe_name.is_empty() {
+        format!("{}.json", &config.id[..8])
+    } else {
+        format!("{}.json", safe_name)
+    };
+    let path = dir.join(&filename);
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|e| AppError::Config(format!("Cannot delete config file: {}", e)))?;
+    }
+    Ok(())
+}
+
 /// Shared application state: a map of pool_key -> PgPool.
 /// Pool keys: "connection_id" for the primary database,
 ///            "connection_id:database_name" for other databases on the same server.
@@ -111,6 +178,7 @@ pub async fn get_or_create_db_pool(
 
 /// Add a new connection and store credentials.
 /// Always saves the connection; creates a pool only if reachable.
+/// Persists the connection as a JSON file in ~/.config/bestgres/connections/.
 #[tauri::command]
 pub async fn add_connection(
     state: State<'_, AppState>,
@@ -118,6 +186,9 @@ pub async fn add_connection(
     password: String,
 ) -> Result<(), AppError> {
     store_password(&config.id, &password)?;
+
+    // Persist to config file
+    let _ = save_connection_to_file(&config, &password);
 
     // Try to connect — save the connection regardless of outcome
     let conn_str = build_connection_string(
@@ -128,11 +199,9 @@ pub async fn add_connection(
         &config.database,
         config.ssl,
     );
-    if let Ok(pool) = postgres::create_pool(&conn_str).await {
-        if postgres::test_connection(&pool).await.is_ok() {
-            let mut pools = state.pools.lock().await;
-            pools.insert(config.id.clone(), pool);
-        }
+    if let Ok(pool) = postgres::create_pool_lazy(&conn_str) {
+        let mut pools = state.pools.lock().await;
+        pools.insert(config.id.clone(), pool);
     }
 
     let mut connections = state.connections.lock().await;
@@ -143,6 +212,7 @@ pub async fn add_connection(
 
 /// Update an existing connection's configuration.
 /// If password is non-empty, update it in keychain. Otherwise keep the old one.
+/// Re-persists the connection to the config file.
 #[tauri::command]
 pub async fn update_connection(
     state: State<'_, AppState>,
@@ -156,24 +226,23 @@ pub async fn update_connection(
         password.clone()
     };
 
-    // Test new config
-    let conn_str = build_connection_string(
-        &config.host,
-        config.port,
-        &config.user,
-        &effective_password,
-        &config.database,
-        config.ssl,
-    );
-    let pool = postgres::create_pool(&conn_str).await?;
-    postgres::test_connection(&pool).await?;
-
     // Update password if provided
     if !password.is_empty() {
         store_password(&config.id, &password)?;
     }
 
-    // Close old pools for this connection (primary + any database-specific ones)
+    // Delete old config file (old name may differ)
+    {
+        let connections = state.connections.lock().await;
+        if let Some(old) = connections.iter().find(|c| c.id == config.id) {
+            let _ = delete_connection_file(old);
+        }
+    }
+
+    // Persist updated config
+    let _ = save_connection_to_file(&config, &effective_password);
+
+    // Close old pools for this connection
     {
         let mut pools = state.pools.lock().await;
         let keys_to_remove: Vec<String> = pools
@@ -186,10 +255,23 @@ pub async fn update_connection(
                 old_pool.close().await;
             }
         }
+    }
+
+    // Create a lazy pool for the updated config
+    let conn_str = build_connection_string(
+        &config.host,
+        config.port,
+        &config.user,
+        &effective_password,
+        &config.database,
+        config.ssl,
+    );
+    if let Ok(pool) = postgres::create_pool_lazy(&conn_str) {
+        let mut pools = state.pools.lock().await;
         pools.insert(config.id.clone(), pool);
     }
 
-    // Update config
+    // Update config in state
     let mut connections = state.connections.lock().await;
     if let Some(existing) = connections.iter_mut().find(|c| c.id == config.id) {
         *existing = config;
@@ -198,12 +280,20 @@ pub async fn update_connection(
     Ok(())
 }
 
-/// Remove a connection entirely.
+/// Remove a connection entirely. Deletes its config file too.
 #[tauri::command]
 pub async fn remove_connection(
     state: State<'_, AppState>,
     connection_id: String,
 ) -> Result<(), AppError> {
+    // Delete config file
+    {
+        let connections = state.connections.lock().await;
+        if let Some(config) = connections.iter().find(|c| c.id == connection_id) {
+            let _ = delete_connection_file(config);
+        }
+    }
+
     // Close all pools for this connection
     {
         let mut pools = state.pools.lock().await;
@@ -219,7 +309,7 @@ pub async fn remove_connection(
         }
     }
 
-    // Remove config
+    // Remove config from state
     let mut connections = state.connections.lock().await;
     connections.retain(|c| c.id != connection_id);
 
@@ -278,6 +368,26 @@ pub async fn disconnect(
     Ok(())
 }
 
+/// Check if a connection is alive by running SELECT 1.
+/// Returns true if reachable, false otherwise.
+#[tauri::command]
+pub async fn check_connection(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> Result<bool, AppError> {
+    let pools = state.pools.lock().await;
+    let pool = match pools.get(&connection_id) {
+        Some(p) => p.clone(),
+        None => return Ok(false),
+    };
+    drop(pools);
+
+    match postgres::test_connection(&pool).await {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
 /// List all saved connections.
 #[tauri::command]
 pub async fn list_connections(
@@ -293,17 +403,7 @@ pub async fn list_connections(
 pub async fn load_config_connections(
     state: State<'_, AppState>,
 ) -> Result<Vec<ConnectionConfig>, AppError> {
-    let config_dir = dirs::config_dir()
-        .ok_or_else(|| AppError::Config("Cannot determine config directory".into()))?
-        .join("bestgres")
-        .join("connections");
-
-    // Create directory if it doesn't exist
-    if !config_dir.exists() {
-        std::fs::create_dir_all(&config_dir)
-            .map_err(|e| AppError::Config(format!("Cannot create config dir: {}", e)))?;
-        return Ok(Vec::new());
-    }
+    let config_dir = connections_dir()?;
 
     let entries = std::fs::read_dir(&config_dir)
         .map_err(|e| AppError::Config(format!("Cannot read config dir: {}", e)))?;
