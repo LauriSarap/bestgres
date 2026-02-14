@@ -3,6 +3,7 @@ use tauri::State;
 use crate::commands::connection::{get_or_create_db_pool, AppState};
 use crate::db::postgres;
 use crate::models::{AppError, ColumnInfo, QueryResult, SchemaObject, TableStructure};
+use serde_json::Value as JsonValue;
 
 /// List all databases on the server for a connection.
 #[tauri::command]
@@ -29,6 +30,20 @@ pub async fn get_schema(
 ) -> Result<Vec<SchemaObject>, AppError> {
     let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
     postgres::get_schema_objects(&pool).await
+}
+
+/// Get primary key column names for a table, in constraint order.
+/// Returns empty vec if the table has no primary key (e.g. views).
+#[tauri::command]
+pub async fn get_primary_key_columns(
+    state: State<'_, AppState>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    table: String,
+) -> Result<Vec<String>, AppError> {
+    let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
+    postgres::get_primary_key_columns(&pool, &schema, &table).await
 }
 
 /// Get columns for a specific table.
@@ -67,4 +82,30 @@ pub async fn execute_query(
 ) -> Result<QueryResult, AppError> {
     let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
     postgres::execute_query(&pool, &sql).await
+}
+
+/// Update a single cell value in a table. Requires a primary key to identify the row.
+#[tauri::command]
+pub async fn update_cell(
+    state: State<'_, AppState>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    table: String,
+    column: String,
+    primary_key_columns: Vec<String>,
+    primary_key_values: Vec<JsonValue>,
+    new_value: JsonValue,
+) -> Result<u64, AppError> {
+    let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
+    postgres::update_cell(
+        &pool,
+        &schema,
+        &table,
+        &column,
+        &primary_key_columns,
+        &primary_key_values,
+        &new_value,
+    )
+    .await
 }

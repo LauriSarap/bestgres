@@ -20,9 +20,11 @@ pub fn run() {
             commands::connection::load_config_connections,
             commands::query::list_databases,
             commands::query::get_schema,
+            commands::query::get_primary_key_columns,
             commands::query::get_columns,
             commands::query::get_table_structure,
             commands::query::execute_query,
+            commands::query::update_cell,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

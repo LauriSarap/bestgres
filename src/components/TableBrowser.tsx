@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Loader2, AlertCircle, Clock, Rows3, ChevronDown } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { DataGrid } from "@/components/DataGrid";
+import { EditableCell } from "@/components/EditableCell";
 import type { QueryResult, ColumnInfo } from "@/types";
 
 const PAGE_SIZE = 100;
@@ -18,6 +19,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
   const [rows, setRows] = useState<unknown[][]>([]);
   const [columnNames, setColumnNames] = useState<string[]>([]);
   const [columnTypes, setColumnTypes] = useState<Map<string, string>>(new Map());
+  const [primaryKeyColumns, setPrimaryKeyColumns] = useState<string[]>([]);
   const [totalCount, setTotalCount] = useState<number | null>(null);
   const [execTime, setExecTime] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -34,11 +36,12 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
       setRows([]);
       setColumnNames([]);
       setColumnTypes(new Map());
+      setPrimaryKeyColumns([]);
       setTotalCount(null);
 
       try {
-        // Fire all three queries in parallel
-        const [dataRes, countRes, colInfo] = await Promise.all([
+        // Fire all four queries in parallel
+        const [dataRes, countRes, colInfo, pkCols] = await Promise.all([
           invoke<QueryResult>("execute_query", {
             connectionId,
             database,
@@ -50,6 +53,12 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
             sql: `SELECT COUNT(*) FROM "${schema}"."${table}"`,
           }),
           invoke<ColumnInfo[]>("get_columns", {
+            connectionId,
+            database,
+            schema,
+            table,
+          }),
+          invoke<string[]>("get_primary_key_columns", {
             connectionId,
             database,
             schema,
@@ -75,6 +84,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
           typeMap.set(col.name, col.data_type);
         }
         setColumnTypes(typeMap);
+        setPrimaryKeyColumns(pkCols);
       } catch (err) {
         if (!cancelled) setError(String(err));
       } finally {
@@ -105,32 +115,105 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     }
   }, [connectionId, database, schema, table, rows.length, loadingMore]);
 
+  const handleCellSave = useCallback(
+    async (
+      rowIndex: number,
+      columnName: string,
+      newValue: string | number | boolean | null
+    ) => {
+      const rowArr = rows[rowIndex];
+      if (!rowArr) return;
+      const pkValues = primaryKeyColumns.map((pk) => {
+        const colIndex = columnNames.indexOf(pk);
+        return colIndex >= 0 ? rowArr[colIndex] ?? null : null;
+      });
+      const jsonValue =
+        newValue === null
+          ? null
+          : typeof newValue === "boolean"
+            ? newValue
+            : typeof newValue === "number"
+              ? newValue
+              : newValue;
+      await invoke("update_cell", {
+        connectionId,
+        database,
+        schema,
+        table,
+        column: columnName,
+        primaryKeyColumns,
+        primaryKeyValues: pkValues,
+        newValue: jsonValue,
+      });
+      const colIndex = columnNames.indexOf(columnName);
+      if (colIndex === -1) return;
+      setRows((prev) => {
+        const next = [...prev];
+        const rowCopy = [...next[rowIndex]];
+        rowCopy[colIndex] = newValue;
+        next[rowIndex] = rowCopy;
+        return next;
+      });
+    },
+    [
+      connectionId,
+      database,
+      schema,
+      table,
+      primaryKeyColumns,
+      columnNames,
+      rows,
+    ]
+  );
+
   const columns: ColumnDef<Record<string, unknown>, unknown>[] = useMemo(() => {
     if (columnNames.length === 0) return [];
-    return columnNames.map((col) => ({
-      accessorKey: col,
-      header: () => (
-        <div className="flex flex-col gap-0.5">
-          <span>{col}</span>
-          {columnTypes.has(col) && (
-            <span className="font-normal text-[10px] text-muted-foreground/70">
-              {columnTypes.get(col)}
-            </span>
-          )}
-        </div>
-      ),
-      cell: ({ getValue }) => {
-        const v = getValue();
-        if (v === null || v === undefined) {
-          return <span className="text-muted-foreground/50 italic">NULL</span>;
-        }
-        if (typeof v === "object") {
-          return JSON.stringify(v);
-        }
-        return String(v);
-      },
-    }));
-  }, [columnNames, columnTypes]);
+    const canEdit = primaryKeyColumns.length > 0;
+    return columnNames.map((col) => {
+      const isPk = primaryKeyColumns.includes(col);
+      const editable = canEdit && !isPk;
+      return {
+        accessorKey: col,
+        header: () => (
+          <div className="flex flex-col gap-0.5">
+            <span>{col}</span>
+            {columnTypes.has(col) && (
+              <span className="font-normal text-[10px] text-muted-foreground/70">
+                {columnTypes.get(col)}
+              </span>
+            )}
+          </div>
+        ),
+        cell: ({ getValue, row }) => {
+          const v = getValue();
+          const rowIndex = row.index;
+          if (editable) {
+            return (
+              <EditableCell
+                value={v}
+                onSave={(newVal) =>
+                  handleCellSave(rowIndex, col, newVal)
+                }
+                disabled={false}
+              />
+            );
+          }
+          if (v === null || v === undefined) {
+            return <span className="text-muted-foreground/50 italic">NULL</span>;
+          }
+          if (typeof v === "object") {
+            return JSON.stringify(v);
+          }
+          return String(v);
+        },
+      };
+    });
+  }, [
+    columnNames,
+    columnTypes,
+    primaryKeyColumns,
+    handleCellSave,
+  ]);
 
   const data: Record<string, unknown>[] = useMemo(() => {
     return rows.map((row) => {

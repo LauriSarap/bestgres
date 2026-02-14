@@ -49,7 +49,7 @@
 - [x] Stable column widths (no horizontal jitter on scroll)
 - [x] NULL display (italic muted placeholder)
 - [x] JSON/JSONB columns rendered as `JSON.stringify` instead of `[object Object]`
-- [ ] **Inline cell editing** — click a cell to edit its value, save with Enter, cancel with Escape
+- [x] **Inline cell editing** — click a cell to edit its value, save with Enter, cancel with Escape
 - [ ] **Add new row** — button to insert a blank row, fill in values, and INSERT
 - [ ] **Delete row(s)** — select one or more rows and delete them
 - [ ] **Column sorting** — click column header to sort ASC/DESC

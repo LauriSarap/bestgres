@@ -320,6 +320,111 @@ pub async fn get_table_structure(
     })
 }
 
+/// Get primary key column names for a table, in constraint order.
+/// Returns empty vec if the table has no primary key.
+pub async fn get_primary_key_columns(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, AppError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+         AND tc.table_name = kcu.table_name
+        WHERE tc.constraint_type = 'PRIMARY KEY'
+          AND tc.table_schema = $1 AND tc.table_name = $2
+        ORDER BY kcu.ordinal_position
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(rows.iter().map(|r| r.get("column_name")).collect())
+}
+
+/// Validate that a string is a safe PostgreSQL identifier (for schema, table, column).
+fn is_valid_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && s.chars().next().map(|c| !c.is_ascii_digit()).unwrap_or(false)
+}
+
+/// Update a single cell value. Uses parameterized queries for values; validates identifiers.
+pub async fn update_cell(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+    column: &str,
+    primary_key_columns: &[String],
+    primary_key_values: &[serde_json::Value],
+    new_value: &serde_json::Value,
+) -> Result<u64, AppError> {
+    if !is_valid_identifier(schema) || !is_valid_identifier(table) || !is_valid_identifier(column) {
+        return Err(AppError::Database("Invalid identifier".into()));
+    }
+    if primary_key_columns.is_empty() {
+        return Err(AppError::Database("Table has no primary key; cannot update".into()));
+    }
+    if primary_key_columns.len() != primary_key_values.len() {
+        return Err(AppError::Database("Primary key column/value count mismatch".into()));
+    }
+    for pk_col in primary_key_columns {
+        if !is_valid_identifier(pk_col) {
+            return Err(AppError::Database("Invalid primary key column name".into()));
+        }
+    }
+
+    // Build: UPDATE "schema"."table" SET "column" = $1 WHERE "pk1" = $2 AND "pk2" = $3 ...
+    let set_clause = format!(r#""{}" = $1"#, column);
+    let mut param_idx = 2u32;
+    let where_parts: Vec<String> = primary_key_columns
+        .iter()
+        .map(|c| {
+            let part = format!(r#""{}" = ${}"#, c, param_idx);
+            param_idx += 1;
+            part
+        })
+        .collect();
+    let where_clause = where_parts.join(" AND ");
+    let sql = format!(
+        r#"UPDATE "{}"."{}" SET {} WHERE {}"#,
+        schema,
+        table,
+        set_clause,
+        where_clause
+    );
+
+    let mut q = sqlx::query(&sql).bind(serde_json_value_to_sql(new_value));
+
+    for v in primary_key_values {
+        q = q.bind(serde_json_value_to_sql(v));
+    }
+
+    let result = q.execute(pool).await.map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(result.rows_affected())
+}
+
+/// Convert serde_json::Value to a type sqlx can bind.
+/// We use a custom enum/struct to handle the variety of types.
+fn serde_json_value_to_sql(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            Some(serde_json::to_string(v).unwrap_or_default())
+        }
+    }
+}
+
 /// Execute an arbitrary SQL query and return results as JSON values.
 pub async fn execute_query(pool: &PgPool, sql: &str) -> Result<QueryResult, AppError> {
     let start = std::time::Instant::now();
