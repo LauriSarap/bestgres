@@ -74,6 +74,21 @@ export interface Tab {
   table?: string;
 }
 
+/** Query history entry */
+export interface HistoryEntry {
+  sql: string;
+  database: string;
+  executed_at: string;
+}
+
+/** Saved / favorite query */
+export interface SavedQuery {
+  id: string;
+  name: string;
+  sql: string;
+  database: string;
+}
+
 /** A connected database shown in the sidebar */
 export interface ConnectionEntry {
   id: string;

@@ -31,7 +31,6 @@ export function TabManager({
   onCloseOtherTabs,
   onCloseTabsToRight,
 }: TabManagerProps) {
-  const activeTab = tabs.find((t) => t.id === activeTabId);
   const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -116,34 +115,40 @@ export function TabManager({
         </div>
       )}
 
-      <div className="flex-1 overflow-hidden">
-        {!activeTab ? (
+      <div className="flex-1 overflow-hidden relative">
+        {tabs.length === 0 && (
           <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
             Open a table or start a new query
           </div>
-        ) : activeTab.type === "table-browser" && activeTab.schema && activeTab.table ? (
-          <TableBrowser
-            key={activeTab.id}
-            connectionId={activeTab.connectionId}
-            database={activeTab.database}
-            schema={activeTab.schema}
-            table={activeTab.table}
-          />
-        ) : activeTab.type === "table-structure" && activeTab.schema && activeTab.table ? (
-          <TableStructureView
-            key={activeTab.id}
-            connectionId={activeTab.connectionId}
-            database={activeTab.database}
-            schema={activeTab.schema}
-            table={activeTab.table}
-          />
-        ) : activeTab.type === "query-editor" ? (
-          <QueryEditor
-            key={activeTab.id}
-            connectionId={activeTab.connectionId}
-            database={activeTab.database}
-          />
-        ) : null}
+        )}
+        {tabs.map((tab) => (
+          <div
+            key={tab.id}
+            className="absolute inset-0"
+            style={{ visibility: tab.id === activeTabId ? "visible" : "hidden", zIndex: tab.id === activeTabId ? 1 : 0 }}
+          >
+            {tab.type === "table-browser" && tab.schema && tab.table ? (
+              <TableBrowser
+                connectionId={tab.connectionId}
+                database={tab.database}
+                schema={tab.schema}
+                table={tab.table}
+              />
+            ) : tab.type === "table-structure" && tab.schema && tab.table ? (
+              <TableStructureView
+                connectionId={tab.connectionId}
+                database={tab.database}
+                schema={tab.schema}
+                table={tab.table}
+              />
+            ) : tab.type === "query-editor" ? (
+              <QueryEditor
+                connectionId={tab.connectionId}
+                database={tab.database}
+              />
+            ) : null}
+          </div>
+        ))}
       </div>
 
       {/* Context Menu */}

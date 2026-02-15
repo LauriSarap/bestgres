@@ -1,9 +1,10 @@
-import { useEffect, useState, useMemo, useCallback, useRef } from "react";
+import { useEffect, useState, useMemo, useCallback, useRef, type SetStateAction } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Loader2, AlertCircle, Clock, Rows3, ChevronDown, Plus, Trash2, ArrowUp, ArrowDown, ArrowUpDown, Filter, X } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { DataGrid } from "@/components/DataGrid";
 import { EditableCell } from "@/components/EditableCell";
+import { useToast } from "@/components/Toast";
 import type { QueryResult, ColumnInfo } from "@/types";
 
 const PAGE_SIZE = 100;
@@ -22,6 +23,7 @@ interface TableBrowserProps {
 }
 
 export function TableBrowser({ connectionId, database, schema, table }: TableBrowserProps) {
+  const { toast } = useToast();
   const [rows, setRows] = useState<unknown[][]>([]);
   const [columnNames, setColumnNames] = useState<string[]>([]);
   const [columnTypes, setColumnTypes] = useState<Map<string, string>>(new Map());
@@ -259,8 +261,10 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
         sql: buildSelectSql(PAGE_SIZE),
       });
       setRows(res.rows);
+      toast("success", "Row inserted");
     } catch (err) {
       setInsertError(String(err));
+      toast("error", "Insert failed");
     } finally {
       setInserting(false);
     }
@@ -274,6 +278,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     draftValues,
     parseCellValue,
     buildSelectSql,
+    toast,
   ]);
 
   const handleDelete = useCallback(async () => {
@@ -316,8 +321,10 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
       );
       setRows((prev) => prev.filter((_, i) => !indicesToRemove.has(i)));
       setTotalCount((c) => (c !== null ? Math.max(0, c - selectedIds.length) : null));
+      toast("success", `Deleted ${selectedIds.length} row${selectedIds.length > 1 ? "s" : ""}`);
     } catch (err) {
       setError(String(err));
+      toast("error", "Delete failed");
     } finally {
       setDeleting(false);
     }
@@ -330,6 +337,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     primaryKeyColumns,
     columnNames,
     rows,
+    toast,
   ]);
 
   const getRowId = useCallback(
@@ -342,26 +350,31 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     [primaryKeyColumns]
   );
 
+  const handleRowSelectionChange = useCallback(
+    (updater: SetStateAction<Record<string, boolean>>) => {
+      setRowSelection((prev) => {
+        const next = typeof updater === "function" ? updater(prev) : updater;
+        return next ?? {};
+      });
+    },
+    []
+  );
+
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+
   const handleCellSave = useCallback(
     async (
       rowIndex: number,
       columnName: string,
       newValue: string | number | boolean | null
     ) => {
-      const rowArr = rows[rowIndex];
+      const rowArr = rowsRef.current[rowIndex];
       if (!rowArr) return;
       const pkValues = primaryKeyColumns.map((pk) => {
         const colIndex = columnNames.indexOf(pk);
         return colIndex >= 0 ? rowArr[colIndex] ?? null : null;
       });
-      const jsonValue =
-        newValue === null
-          ? null
-          : typeof newValue === "boolean"
-            ? newValue
-            : typeof newValue === "number"
-              ? newValue
-              : newValue;
       await invoke("update_cell", {
         connectionId,
         database,
@@ -370,7 +383,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
         column: columnName,
         primaryKeyColumns,
         primaryKeyValues: pkValues,
-        newValue: jsonValue,
+        newValue,
       });
       const colIndex = columnNames.indexOf(columnName);
       if (colIndex === -1) return;
@@ -381,16 +394,9 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
         next[rowIndex] = rowCopy;
         return next;
       });
+      toast("success", `Updated ${columnName}`);
     },
-    [
-      connectionId,
-      database,
-      schema,
-      table,
-      primaryKeyColumns,
-      columnNames,
-      rows,
-    ]
+    [connectionId, database, schema, table, primaryKeyColumns, columnNames, toast]
   );
 
   const toggleSort = useCallback(
@@ -424,32 +430,37 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     setDataGeneration((g) => g + 1);
   }, []);
 
-  const selectionColumn: ColumnDef<Record<string, unknown>, unknown> | null =
-    primaryKeyColumns.length > 0
-      ? {
-          id: "select",
-          size: 32,
-          header: ({ table }) => (
-            <input
-              type="checkbox"
-              checked={table.getIsAllRowsSelected()}
-              ref={(el) => {
-                if (el) el.indeterminate = table.getIsSomeRowsSelected();
-              }}
-              onChange={table.getToggleAllRowsSelectedHandler()}
-              className="cursor-pointer"
-            />
-          ),
-          cell: ({ row }) => (
-            <input
-              type="checkbox"
-              checked={row.getIsSelected()}
-              onChange={row.getToggleSelectedHandler()}
-              className="cursor-pointer"
-            />
-          ),
-        }
-      : null;
+  const hasPk = primaryKeyColumns.length > 0;
+
+  const selectionColumn: ColumnDef<Record<string, unknown>, unknown> | null = useMemo(
+    () =>
+      hasPk
+        ? {
+            id: "select",
+            size: 32,
+            header: ({ table }) => (
+              <input
+                type="checkbox"
+                checked={table.getIsAllRowsSelected()}
+                ref={(el) => {
+                  if (el) el.indeterminate = table.getIsSomeRowsSelected();
+                }}
+                onChange={table.getToggleAllRowsSelectedHandler()}
+                className="cursor-pointer"
+              />
+            ),
+            cell: ({ row }) => (
+              <input
+                type="checkbox"
+                checked={row.getIsSelected()}
+                onChange={row.getToggleSelectedHandler()}
+                className="cursor-pointer"
+              />
+            ),
+          }
+        : null,
+    [hasPk]
+  );
 
   const columns: ColumnDef<Record<string, unknown>, unknown>[] = useMemo(() => {
     if (columnNames.length === 0) return [];
@@ -554,8 +565,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
   }
 
   const selectedCount = Object.values(rowSelection).filter(Boolean).length;
-  const canAddRow = primaryKeyColumns.length > 0;
-  const canDelete = primaryKeyColumns.length > 0 && selectedCount > 0;
+  const canDelete = hasPk && selectedCount > 0;
   const activeFilterCount = Object.values(columnFilters).filter((v) => v.trim()).length;
 
   return (
@@ -592,7 +602,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
           )}
         </div>
         <div className="flex items-center gap-2">
-          {canAddRow && !showAddRow && (
+          {hasPk && !showAddRow && (
             <button
               onClick={() => {
                 setShowAddRow(true);
@@ -696,18 +706,9 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
         data={data}
         columns={columns}
         className="flex-1"
-        rowSelection={canAddRow ? rowSelection : undefined}
-        onRowSelectionChange={
-          canAddRow
-            ? (updater) =>
-                setRowSelection((prev) => {
-                  const next =
-                    typeof updater === "function" ? updater(prev) : updater;
-                  return next ?? {};
-                })
-            : undefined
-        }
-        getRowId={(row) => getRowId(row)}
+        rowSelection={hasPk ? rowSelection : undefined}
+        onRowSelectionChange={hasPk ? handleRowSelectionChange : undefined}
+        getRowId={hasPk ? getRowId : undefined}
       />
       {hasMore && (
         <div className="flex items-center justify-center border-t border-border py-2">

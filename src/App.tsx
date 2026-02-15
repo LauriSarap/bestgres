@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Sidebar } from "@/components/Sidebar";
 import { TabManager } from "@/components/TabManager";
@@ -6,11 +6,21 @@ import {
   ConnectionDialog,
   type ConnectionFormData,
 } from "@/components/ConnectionDialog";
+import { ToastProvider, useToast } from "@/components/Toast";
 import { useTheme } from "@/hooks/use-theme";
 import type { Tab, ConnectionEntry } from "@/types";
 
 function App() {
+  return (
+    <ToastProvider>
+      <AppInner />
+    </ToastProvider>
+  );
+}
+
+function AppInner() {
   const { theme, toggleTheme } = useTheme();
+  const { toast } = useToast();
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -123,7 +133,8 @@ function App() {
       },
     ]);
     setActiveConnectionId(id);
-  }, []);
+    toast("success", `Connected to ${data.name}`);
+  }, [toast]);
 
   const handleEditConnection = useCallback(async (data: ConnectionFormData) => {
     if (!editingConnection) return;
@@ -155,7 +166,8 @@ function App() {
           : c
       )
     );
-  }, [editingConnection]);
+    toast("success", `Updated ${data.name}`);
+  }, [editingConnection, toast]);
 
   const handleSelectConnection = useCallback((id: string) => {
     setActiveConnectionId(id);
@@ -223,6 +235,71 @@ function App() {
     },
     [connections, openTab]
   );
+
+  /* ── Keyboard shortcuts ── */
+
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+  const activeTabIdRef = useRef(activeTabId);
+  activeTabIdRef.current = activeTabId;
+  const connectionsRef = useRef(connections);
+  connectionsRef.current = connections;
+  const activeConnectionIdRef = useRef(activeConnectionId);
+  activeConnectionIdRef.current = activeConnectionId;
+
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      const ctrl = e.ctrlKey || e.metaKey;
+
+      // Ctrl+T — new query tab
+      if (ctrl && e.key === "t") {
+        e.preventDefault();
+        const connId = activeConnectionIdRef.current;
+        if (!connId) return;
+        const conn = connectionsRef.current.find((c) => c.id === connId);
+        if (!conn) return;
+        // Find a database for this connection: use the active tab's database, or the connection's default
+        const currentTab = tabsRef.current.find((t) => t.id === activeTabIdRef.current);
+        const db = (currentTab?.connectionId === connId ? currentTab?.database : null) ?? conn.database;
+        openTab({
+          id: crypto.randomUUID(),
+          title: `Query — ${conn.name} / ${db}`,
+          type: "query-editor",
+          connectionId: connId,
+          database: db,
+        });
+        return;
+      }
+
+      // Ctrl+W — close active tab
+      if (ctrl && e.key === "w") {
+        e.preventDefault();
+        const id = activeTabIdRef.current;
+        if (id) handleCloseTab(id);
+        return;
+      }
+
+      // Ctrl+Tab / Ctrl+Shift+Tab — switch tabs
+      if (ctrl && e.key === "Tab") {
+        e.preventDefault();
+        const currentTabs = tabsRef.current;
+        const currentId = activeTabIdRef.current;
+        if (currentTabs.length <= 1) return;
+        const idx = currentTabs.findIndex((t) => t.id === currentId);
+        let nextIdx: number;
+        if (e.shiftKey) {
+          nextIdx = idx <= 0 ? currentTabs.length - 1 : idx - 1;
+        } else {
+          nextIdx = idx >= currentTabs.length - 1 ? 0 : idx + 1;
+        }
+        setActiveTabId(currentTabs[nextIdx].id);
+        return;
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [openTab, handleCloseTab]);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">

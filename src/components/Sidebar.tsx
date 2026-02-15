@@ -63,21 +63,28 @@ export function Sidebar({
 
   // Check health for all connections on mount and when connections change
   useEffect(() => {
-    async function checkAll() {
-      for (const conn of connections) {
+    if (connections.length === 0) return;
+    let cancelled = false;
+
+    Promise.all(
+      connections.map(async (conn) => {
         try {
           const alive = await invoke<boolean>("check_connection", {
             connectionId: conn.id,
           });
-          setHealth((prev) => ({ ...prev, [conn.id]: alive }));
+          return { id: conn.id, alive };
         } catch {
-          setHealth((prev) => ({ ...prev, [conn.id]: false }));
+          return { id: conn.id, alive: false };
         }
-      }
-    }
-    if (connections.length > 0) {
-      checkAll();
-    }
+      })
+    ).then((results) => {
+      if (cancelled) return;
+      const next: Record<string, boolean> = {};
+      for (const r of results) next[r.id] = r.alive;
+      setHealth((prev) => ({ ...prev, ...next }));
+    });
+
+    return () => { cancelled = true; };
   }, [connections]);
 
   const toggleConnection = useCallback(

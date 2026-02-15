@@ -106,6 +106,23 @@ pub struct QueryResult {
     pub execution_time_ms: u64,
 }
 
+/// A single entry in query history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub sql: String,
+    pub database: String,
+    pub executed_at: String,
+}
+
+/// A saved / favorite query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedQuery {
+    pub id: String,
+    pub name: String,
+    pub sql: String,
+    pub database: String,
+}
+
 /// Errors returned to the frontend as user-friendly strings.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {

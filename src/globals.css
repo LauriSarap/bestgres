@@ -120,6 +120,71 @@ body {
   background: var(--color-muted-foreground);
 }
 
+/* ── SQL Editor ── */
+.sql-editor-container {
+  position: relative;
+  background: var(--color-background);
+}
+
+.sql-editor-textarea,
+.sql-editor-highlight {
+  margin: 0;
+  border: 0;
+  padding: 0.75rem 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  line-height: 1.5;
+  letter-spacing: normal;
+  word-spacing: normal;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  box-sizing: border-box;
+  tab-size: 2;
+  width: 100%;
+}
+
+.sql-editor-textarea {
+  color: transparent;
+  overflow: hidden; /* no internal scroll — container scrolls */
+  resize: none;
+  height: auto;
+}
+
+.sql-editor-textarea::selection {
+  background: rgba(59, 130, 246, 0.3);
+  color: transparent;
+}
+
+.sql-editor-highlight {
+  color: var(--color-foreground);
+}
+
+.sql-keyword {
+  color: #3b82f6;
+  font-weight: 600;
+}
+
+.sql-function {
+  color: #a78bfa;
+}
+
+.sql-type {
+  color: #06b6d4;
+}
+
+.sql-string {
+  color: #22c55e;
+}
+
+.sql-number {
+  color: #f59e0b;
+}
+
+.sql-comment {
+  color: var(--color-muted-foreground);
+  font-style: italic;
+}
+
 /* ── Checkbox styling ── */
 input[type="checkbox"] {
   accent-color: var(--color-primary);
@@ -129,4 +194,17 @@ input[type="checkbox"] {
 
 .dark input[type="checkbox"] {
   color-scheme: dark;
+}
+
+/* ── Toast animations ── */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes slide-in-from-bottom {
+  from { transform: translateY(8px); }
+  to { transform: translateY(0); }
+}
+.animate-in {
+  animation: fade-in 150ms ease-out, slide-in-from-bottom 150ms ease-out;
 }

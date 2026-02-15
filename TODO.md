@@ -54,18 +54,16 @@
 - [x] **Delete row(s)** — select one or more rows and delete them
 - [x] **Column sorting** — click column header to sort ASC/DESC
 - [x] **Column filtering** — filter input per column or a WHERE clause helper
-- [ ] **Copy cell / row** — right-click to copy a cell value, or copy an entire row as JSON
-- [ ] **Data export** — export table data or query results to CSV, JSON, or SQL INSERT statements
+- [x] **Copy cell / row** — right-click to copy a cell value, or copy an entire row as JSON
 
 ### Query Editor
 - [x] Free-form SQL textarea with Ctrl+Enter to execute
 - [x] Results in virtualized data grid
 - [x] Row count and execution time stats
 - [x] JSON/JSONB display fix
-- [ ] **SQL syntax highlighting** — keyword coloring via CodeMirror or lightweight highlighter
-- [ ] **Query history** — persist executed queries to `~/.config/bestgres/history/`, recall and re-run from a list
-- [ ] **Saved / favorite queries** — name and save useful queries to `~/.config/bestgres/queries/`, accessible from sidebar or command palette
-- [ ] **Data export** — export query results to CSV, JSON, or SQL INSERT statements
+- [x] **SQL syntax highlighting** — keyword coloring via lightweight regex highlighter (textarea overlay)
+- [x] **Query history** — persist executed queries to `~/.config/bestgres/history.json`, recall and re-run from side panel
+- [x] **Saved / favorite queries** — name and save useful queries to `~/.config/bestgres/queries/`, accessible from side panel
 
 ### Tab System
 - [x] Multi-tab interface (table browser + query editor tabs)
@@ -78,8 +76,8 @@
 - [x] Class-based dark mode with CSS variable tokens in Tailwind v4 `@theme`
 
 ### UX & Polish
-- [ ] **Toast notifications** — success/failure feedback for connections, edits, exports, errors
-- [ ] **Keyboard shortcuts** — Ctrl+T new query, Ctrl+W close tab, Ctrl+Tab switch tabs, Ctrl+S save edits
+- [x] **Toast notifications** — success/failure feedback for connections, edits, exports, errors
+- [x] **Keyboard shortcuts** — Ctrl+T new query, Ctrl+W close tab, Ctrl+Tab switch tabs
 
 ### Build & Packaging
 - [x] Tauri v2 build producing deb and rpm bundles

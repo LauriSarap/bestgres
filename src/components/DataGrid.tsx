@@ -1,14 +1,21 @@
-import React, { useRef } from "react";
+import React, { useRef, useState, useEffect, useCallback } from "react";
 import {
   useReactTable,
   getCoreRowModel,
-  getFilteredRowModel,
   flexRender,
   type ColumnDef,
   type RowSelectionState,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
+import { Copy, ClipboardList } from "lucide-react";
+
+interface CellContextMenu {
+  x: number;
+  y: number;
+  cellValue: string;
+  rowJson: string;
+}
 
 interface DataGridProps<TData> {
   data: TData[];
@@ -32,12 +39,44 @@ export const DataGrid = React.memo(function DataGrid<TData>({
   getRowId = (_, i) => String(i),
 }: DataGridProps<TData>) {
   const parentRef = useRef<HTMLDivElement>(null);
+  const [cellMenu, setCellMenu] = useState<CellContextMenu | null>(null);
+  const cellMenuRef = useRef<HTMLDivElement>(null);
+
+  // Close cell context menu on click outside or Escape
+  useEffect(() => {
+    if (!cellMenu) return;
+    function handleClick(e: MouseEvent) {
+      if (cellMenuRef.current && !cellMenuRef.current.contains(e.target as Node)) {
+        setCellMenu(null);
+      }
+    }
+    function handleKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setCellMenu(null);
+    }
+    document.addEventListener("mousedown", handleClick);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handleClick);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [cellMenu]);
+
+  const handleCopyCell = useCallback(() => {
+    if (!cellMenu) return;
+    navigator.clipboard.writeText(cellMenu.cellValue).catch(() => {});
+    setCellMenu(null);
+  }, [cellMenu]);
+
+  const handleCopyRow = useCallback(() => {
+    if (!cellMenu) return;
+    navigator.clipboard.writeText(cellMenu.rowJson).catch(() => {});
+    setCellMenu(null);
+  }, [cellMenu]);
 
   const table = useReactTable({
     data,
     columns,
     getCoreRowModel: getCoreRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
     state: rowSelection !== undefined ? { rowSelection } : {},
     onRowSelectionChange,
     getRowId,
@@ -109,17 +148,38 @@ export const DataGrid = React.memo(function DataGrid<TData>({
                     className="border-b border-border hover:bg-muted/50"
                     style={{ height: virtualRow.size }}
                   >
-                    {row.getVisibleCells().map((cell) => (
-                      <td
-                        key={cell.id}
-                        className="border-r border-border px-3 py-1 text-xs font-mono whitespace-nowrap max-w-80 truncate"
-                      >
-                        {flexRender(
-                          cell.column.columnDef.cell,
-                          cell.getContext()
-                        )}
-                      </td>
-                    ))}
+                    {row.getVisibleCells().map((cell) => {
+                      const rawValue = cell.getValue();
+                      return (
+                        <td
+                          key={cell.id}
+                          className="border-r border-border px-3 py-1 text-xs font-mono whitespace-nowrap max-w-80 truncate"
+                          onContextMenu={(e) => {
+                            // Skip context menu for selection checkbox column
+                            if (cell.column.id === "select") return;
+                            e.preventDefault();
+                            const cellStr =
+                              rawValue === null || rawValue === undefined
+                                ? "NULL"
+                                : typeof rawValue === "object"
+                                  ? JSON.stringify(rawValue)
+                                  : String(rawValue);
+                            const rowObj = row.original as Record<string, unknown>;
+                            setCellMenu({
+                              x: e.clientX,
+                              y: e.clientY,
+                              cellValue: cellStr,
+                              rowJson: JSON.stringify(rowObj, null, 2),
+                            });
+                          }}
+                        >
+                          {flexRender(
+                            cell.column.columnDef.cell,
+                            cell.getContext()
+                          )}
+                        </td>
+                      );
+                    })}
                   </tr>
                 );
               })}
@@ -132,6 +192,30 @@ export const DataGrid = React.memo(function DataGrid<TData>({
           )}
         </tbody>
       </table>
+
+      {/* Cell context menu */}
+      {cellMenu && (
+        <div
+          ref={cellMenuRef}
+          className="fixed z-50 min-w-44 rounded-md border border-border bg-popover py-1 shadow-lg"
+          style={{ left: cellMenu.x, top: cellMenu.y }}
+        >
+          <button
+            onClick={handleCopyCell}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-popover-foreground hover:bg-accent"
+          >
+            <Copy className="h-3 w-3" />
+            Copy cell value
+          </button>
+          <button
+            onClick={handleCopyRow}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-popover-foreground hover:bg-accent"
+          >
+            <ClipboardList className="h-3 w-3" />
+            Copy row as JSON
+          </button>
+        </div>
+      )}
     </div>
   );
 }) as <TData>(props: DataGridProps<TData>) => React.ReactElement;
