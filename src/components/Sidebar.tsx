@@ -14,7 +14,6 @@ import {
   Loader2,
   Pencil,
   HardDrive,
-  AlertCircle,
   RefreshCw,
   FileCode,
 } from "lucide-react";
@@ -89,8 +88,8 @@ export function Sidebar({
 
   const toggleConnection = useCallback(
     async (connId: string) => {
-      // If already expanded and no error, collapse it
-      if (expandedConnections.has(connId) && !connErrors[connId]) {
+      // If already expanded, collapse it (user can "close" even when there's an error)
+      if (expandedConnections.has(connId)) {
         setExpandedConnections((prev) => {
           const next = new Set(prev);
           next.delete(connId);
@@ -102,7 +101,7 @@ export function Sidebar({
       onSelectConnection(connId);
       setExpandedConnections((prev) => new Set(prev).add(connId));
 
-      // Always retry if there was an error, otherwise skip if already loaded
+      // Skip fetch if already loaded and no error
       if (databases[connId] && !connErrors[connId]) return;
 
       setLoadingConn(connId);
@@ -216,17 +215,13 @@ export function Sidebar({
                     onClick={() => toggleConnection(conn.id)}
                     className={cn(
                       "flex flex-1 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs transition-colors",
-                      connError
-                        ? "text-destructive hover:bg-destructive/10"
-                        : conn.id === activeConnectionId
-                          ? "bg-primary/10 text-primary font-medium"
-                          : "text-sidebar-foreground hover:bg-accent"
+                      conn.id === activeConnectionId
+                        ? "bg-primary/10 text-primary font-medium"
+                        : "text-sidebar-foreground hover:bg-accent"
                     )}
                   >
                     {isLoadingConn ? (
                       <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
-                    ) : connError ? (
-                      <AlertCircle className="h-3 w-3 shrink-0" />
                     ) : isExpanded ? (
                       <ChevronDown className="h-3 w-3 shrink-0" />
                     ) : (

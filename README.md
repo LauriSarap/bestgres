@@ -47,6 +47,26 @@ npm run tauri dev       # dev mode
 npm run tauri build     # local production build
 ```
 
+### Sample databases
+
+Two Postgres instances with sample data for testing (requires Docker):
+
+```bash
+npm run db:start        # start postgres1 (5432) and postgres2 (5433)
+npm run db:stop         # stop both
+npm run db:reset        # wipe data and recreate from scratch
+```
+
+Add connections in Bestgres:
+
+| Connection | Host | Port | User | Password | Database |
+|------------|------|------|------|----------|----------|
+| Instance 1 | localhost | 5432 | postgres | postgres | app_db |
+| Instance 2 | localhost | 5433 | postgres | postgres | analytics |
+
+- **app_db**: users, posts, comments, tags (blog-style schema)
+- **analytics**: events, metric_values, dashboards (JSONB, timestamps)
+
 ## Project Structure
 
 ```

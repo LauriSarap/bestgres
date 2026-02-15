@@ -8,7 +8,10 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri:clean": "rm -rf src-tauri/target node_modules dist"
+    "tauri:clean": "rm -rf src-tauri/target node_modules dist",
+    "db:start": "docker compose -f dev/docker-compose.yml up -d",
+    "db:stop": "docker compose -f dev/docker-compose.yml down",
+    "db:reset": "docker compose -f dev/docker-compose.yml down -v && docker compose -f dev/docker-compose.yml up -d"
   },
   "dependencies": {
     "@tanstack/react-table": "^8.21.3",

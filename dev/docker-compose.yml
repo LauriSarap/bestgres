@@ -1,0 +1,28 @@
+services:
+  postgres1:
+    image: postgres:16-alpine
+    container_name: bestgres-dev-pg1
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres1_data:/var/lib/postgresql/data
+      - ./init1:/docker-entrypoint-initdb.d
+
+  postgres2:
+    image: postgres:16-alpine
+    container_name: bestgres-dev-pg2
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres2_data:/var/lib/postgresql/data
+      - ./init2:/docker-entrypoint-initdb.d
+
+volumes:
+  postgres1_data:
+  postgres2_data:
