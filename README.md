@@ -14,7 +14,20 @@ A fast, minimal PostgreSQL client built with Tauri v2, React, and Rust.
 
 **Tabs** — Multi-tab interface with deduplication. Right-click context menu (Close, Close Others, Close All). Keyboard shortcuts: Ctrl+T (new query), Ctrl+W (close tab), Ctrl+Tab (switch).
 
-**General** — Light/dark theme with OS detection. Toast notifications for all actions. Builds to deb, rpm, and AppImage.
+**General** — Light/dark theme with OS detection. Toast notifications for all actions. Cross-platform builds for Linux, Windows, and macOS.
+
+## Download
+
+Grab the latest release for your platform from [**Releases**](../../releases).
+
+| Platform | File |
+|----------|------|
+| Linux (Debian/Ubuntu) | `.deb` |
+| Linux (Fedora/RHEL) | `.rpm` |
+| Linux (portable) | `.AppImage` |
+| Windows | `-setup.exe` (NSIS installer) |
+| macOS (Apple Silicon) | `.dmg` (aarch64) |
+| macOS (Intel) | `.dmg` (x64) |
 
 ## Stack
 
@@ -31,8 +44,18 @@ A fast, minimal PostgreSQL client built with Tauri v2, React, and Rust.
 ```bash
 npm install
 npm run tauri dev       # dev mode
-npm run tauri build     # production build (deb, rpm, appimage)
+npm run tauri build     # local production build
 ```
+
+## Releasing
+
+Push to the `release` branch to trigger a cross-platform build via GitHub Actions:
+
+```bash
+git push origin main:release
+```
+
+This builds for Linux, Windows, and macOS, then creates a draft GitHub Release with all installers attached. Review and publish from the Releases page.
 
 ## Project Structure
 
