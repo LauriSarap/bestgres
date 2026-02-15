@@ -16,6 +16,11 @@ A fast, minimal PostgreSQL client built with Tauri v2, React, and Rust.
 
 **General** — Light/dark theme with OS detection. Toast notifications for all actions. Cross-platform builds for Linux, Windows, and macOS.
 
+## Screenshots
+
+![Example 3](./docs/screenshots/example_3.png)
+![Example 1](./docs/screenshots/example_1.png)
+
 ## Download
 
 Grab the latest release for your platform from [**Releases**](../../releases).
