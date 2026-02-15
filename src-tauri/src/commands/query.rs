@@ -1,4 +1,3 @@
-use serde::Deserialize;
 use tauri::State;
 
 use crate::commands::connection::{get_or_create_db_pool, AppState};
@@ -111,9 +110,10 @@ pub async fn update_cell(
     .await
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct InsertRowParams {
+/// Insert a new row into a table.
+#[tauri::command]
+pub async fn insert_row(
+    state: State<'_, AppState>,
     connection_id: String,
     database: String,
     schema: String,
@@ -121,22 +121,9 @@ pub(crate) struct InsertRowParams {
     columns: Vec<String>,
     values: Vec<JsonValue>,
     column_types: Vec<String>,
-}
-
-/// Insert a new row into a table.
-#[tauri::command]
-pub async fn insert_row(state: State<'_, AppState>, params: InsertRowParams) -> Result<u64, AppError> {
-    let pool =
-        get_or_create_db_pool(&state, &params.connection_id, &params.database).await?;
-    postgres::insert_row(
-        &pool,
-        &params.schema,
-        &params.table,
-        &params.columns,
-        &params.values,
-        &params.column_types,
-    )
-    .await
+) -> Result<u64, AppError> {
+    let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
+    postgres::insert_row(&pool, &schema, &table, &columns, &values, &column_types).await
 }
 
 /// Delete rows by primary key. Each inner vec is one row's PK values.

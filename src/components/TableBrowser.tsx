@@ -1,12 +1,18 @@
-import { useEffect, useState, useMemo, useCallback } from "react";
+import { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Loader2, AlertCircle, Clock, Rows3, ChevronDown, Plus, Trash2 } from "lucide-react";
+import { Loader2, AlertCircle, Clock, Rows3, ChevronDown, Plus, Trash2, ArrowUp, ArrowDown, ArrowUpDown, Filter, X } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { DataGrid } from "@/components/DataGrid";
 import { EditableCell } from "@/components/EditableCell";
 import type { QueryResult, ColumnInfo } from "@/types";
 
 const PAGE_SIZE = 100;
+
+type SortDirection = "asc" | "desc" | null;
+interface SortState {
+  column: string;
+  direction: SortDirection;
+}
 
 interface TableBrowserProps {
   connectionId: string;
@@ -31,12 +37,49 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
   const [inserting, setInserting] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [insertError, setInsertError] = useState<string | null>(null);
+  const [sort, setSort] = useState<SortState>({ column: "", direction: null });
+  const [columnFilters, setColumnFilters] = useState<Record<string, string>>({});
+  const [showFilters, setShowFilters] = useState(false);
 
-  // Initial load: count + first page + column info
+  const buildWhereClause = useCallback((): string => {
+    const parts: string[] = [];
+    for (const [col, val] of Object.entries(columnFilters)) {
+      const trimmed = val.trim();
+      if (!trimmed) continue;
+      // Support: "NULL", "NOT NULL", or ILIKE pattern
+      if (trimmed.toLowerCase() === "null") {
+        parts.push(`"${col}" IS NULL`);
+      } else if (trimmed.toLowerCase() === "not null") {
+        parts.push(`"${col}" IS NOT NULL`);
+      } else {
+        // Use ILIKE for text search; cast to text for non-text columns
+        parts.push(`"${col}"::text ILIKE '%${trimmed.replace(/'/g, "''")}%'`);
+      }
+    }
+    return parts.length > 0 ? ` WHERE ${parts.join(" AND ")}` : "";
+  }, [columnFilters]);
+
+  const buildOrderClause = useCallback((): string => {
+    if (!sort.column || !sort.direction) return "";
+    return ` ORDER BY "${sort.column}" ${sort.direction.toUpperCase()}`;
+  }, [sort]);
+
+  const buildSelectSql = useCallback(
+    (limit: number, offset = 0): string => {
+      return `SELECT * FROM "${schema}"."${table}"${buildWhereClause()}${buildOrderClause()} LIMIT ${limit} OFFSET ${offset}`;
+    },
+    [schema, table, buildWhereClause, buildOrderClause]
+  );
+
+  const buildCountSql = useCallback((): string => {
+    return `SELECT COUNT(*) FROM "${schema}"."${table}"${buildWhereClause()}`;
+  }, [schema, table, buildWhereClause]);
+
+  // Load metadata (columns, PK) — only when the table changes
   useEffect(() => {
     let cancelled = false;
 
-    async function loadInitial() {
+    async function loadMeta() {
       setLoading(true);
       setError(null);
       setRows([]);
@@ -47,9 +90,10 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
       setShowAddRow(false);
       setRowSelection({});
       setInsertError(null);
+      setSort({ column: "", direction: null });
+      setColumnFilters({});
 
       try {
-        // Fire all four queries in parallel
         const [dataRes, countRes, colInfo, pkCols] = await Promise.all([
           invoke<QueryResult>("execute_query", {
             connectionId,
@@ -81,13 +125,11 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
         setRows(dataRes.rows);
         setExecTime(dataRes.execution_time_ms);
 
-        // Parse count
         const cnt = countRes.rows[0]?.[0];
         if (cnt !== null && cnt !== undefined) {
           setTotalCount(Number(cnt));
         }
 
-        // Build column type map
         const typeMap = new Map<string, string>();
         for (const col of colInfo) {
           typeMap.set(col.name, col.data_type);
@@ -101,9 +143,53 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
       }
     }
 
-    loadInitial();
+    loadMeta();
     return () => { cancelled = true; };
   }, [connectionId, database, schema, table]);
+
+  // Refetch data when sort/filter changes (not on initial load)
+  const [dataGeneration, setDataGeneration] = useState(0);
+  useEffect(() => {
+    // Skip the first render — the metadata effect handles the initial load
+    if (loading) return;
+    let cancelled = false;
+
+    async function refetchData() {
+      setError(null);
+      setRowSelection({});
+
+      try {
+        const [dataRes, countRes] = await Promise.all([
+          invoke<QueryResult>("execute_query", {
+            connectionId,
+            database,
+            sql: buildSelectSql(PAGE_SIZE),
+          }),
+          invoke<QueryResult>("execute_query", {
+            connectionId,
+            database,
+            sql: buildCountSql(),
+          }),
+        ]);
+
+        if (cancelled) return;
+
+        setRows(dataRes.rows);
+        setExecTime(dataRes.execution_time_ms);
+
+        const cnt = countRes.rows[0]?.[0];
+        if (cnt !== null && cnt !== undefined) {
+          setTotalCount(Number(cnt));
+        }
+      } catch (err) {
+        if (!cancelled) setError(String(err));
+      }
+    }
+
+    refetchData();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataGeneration]);
 
   // Load more pages
   const loadMore = useCallback(async () => {
@@ -114,7 +200,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
       const res = await invoke<QueryResult>("execute_query", {
         connectionId,
         database,
-        sql: `SELECT * FROM "${schema}"."${table}" LIMIT ${PAGE_SIZE} OFFSET ${offset}`,
+        sql: buildSelectSql(PAGE_SIZE, offset),
       });
       setRows((prev) => [...prev, ...res.rows]);
     } catch (err) {
@@ -122,7 +208,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     } finally {
       setLoadingMore(false);
     }
-  }, [connectionId, database, schema, table, rows.length, loadingMore]);
+  }, [connectionId, database, schema, table, rows.length, loadingMore, buildSelectSql]);
 
   const parseCellValue = useCallback((raw: string): string | number | boolean | null => {
     const trimmed = raw.trim();
@@ -166,11 +252,11 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
       setDraftValues({});
       setInsertError(null);
       setTotalCount((c) => (c !== null ? c + 1 : null));
-      // Refetch first page to include the new row (order may vary)
+      // Refetch first page to include the new row
       const res = await invoke<QueryResult>("execute_query", {
         connectionId,
         database,
-        sql: `SELECT * FROM "${schema}"."${table}" LIMIT ${PAGE_SIZE}`,
+        sql: buildSelectSql(PAGE_SIZE),
       });
       setRows(res.rows);
     } catch (err) {
@@ -187,6 +273,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     columnTypes,
     draftValues,
     parseCellValue,
+    buildSelectSql,
   ]);
 
   const handleDelete = useCallback(async () => {
@@ -306,6 +393,37 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     ]
   );
 
+  const toggleSort = useCallback(
+    (col: string) => {
+      setSort((prev) => {
+        if (prev.column !== col) return { column: col, direction: "asc" };
+        if (prev.direction === "asc") return { column: col, direction: "desc" };
+        return { column: "", direction: null };
+      });
+      setDataGeneration((g) => g + 1);
+    },
+    []
+  );
+
+  const filterDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleFilterChange = useCallback(
+    (col: string, value: string) => {
+      setColumnFilters((prev) => ({ ...prev, [col]: value }));
+      if (filterDebounceRef.current) clearTimeout(filterDebounceRef.current);
+      filterDebounceRef.current = setTimeout(() => {
+        setDataGeneration((g) => g + 1);
+      }, 400);
+    },
+    []
+  );
+
+  const clearFilters = useCallback(() => {
+    setColumnFilters({});
+    if (filterDebounceRef.current) clearTimeout(filterDebounceRef.current);
+    setDataGeneration((g) => g + 1);
+  }, []);
+
   const selectionColumn: ColumnDef<Record<string, unknown>, unknown> | null =
     primaryKeyColumns.length > 0
       ? {
@@ -339,11 +457,24 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     const dataCols = columnNames.map((col) => {
       const isPk = primaryKeyColumns.includes(col);
       const editable = canEdit && !isPk;
+      const colSort = sort.column === col ? sort.direction : null;
       return {
         accessorKey: col,
         header: () => (
-          <div className="flex flex-col gap-0.5">
-            <span>{col}</span>
+          <div
+            className="flex flex-col gap-0.5 cursor-pointer select-none group"
+            onClick={() => toggleSort(col)}
+          >
+            <div className="flex items-center gap-1">
+              <span>{col}</span>
+              {colSort === "asc" ? (
+                <ArrowUp className="h-3 w-3 text-primary" />
+              ) : colSort === "desc" ? (
+                <ArrowDown className="h-3 w-3 text-primary" />
+              ) : (
+                <ArrowUpDown className="h-3 w-3 opacity-0 group-hover:opacity-40 transition-opacity" />
+              )}
+            </div>
             {columnTypes.has(col) && (
               <span className="font-normal text-[10px] text-muted-foreground/70">
                 {columnTypes.get(col)}
@@ -388,6 +519,8 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     primaryKeyColumns,
     handleCellSave,
     selectionColumn,
+    sort,
+    toggleSort,
   ]);
 
   const data: Record<string, unknown>[] = useMemo(() => {
@@ -423,6 +556,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
   const selectedCount = Object.values(rowSelection).filter(Boolean).length;
   const canAddRow = primaryKeyColumns.length > 0;
   const canDelete = primaryKeyColumns.length > 0 && selectedCount > 0;
+  const activeFilterCount = Object.values(columnFilters).filter((v) => v.trim()).length;
 
   return (
     <div className="flex h-full flex-col">
@@ -436,6 +570,26 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
             <Clock className="h-3 w-3" />
             {execTime}ms
           </span>
+          <button
+            onClick={() => setShowFilters((v) => !v)}
+            className={`flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium transition-colors ${
+              showFilters || activeFilterCount > 0
+                ? "bg-primary/10 text-primary"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            <Filter className="h-3 w-3" />
+            Filter{activeFilterCount > 0 ? ` (${activeFilterCount})` : ""}
+          </button>
+          {activeFilterCount > 0 && (
+            <button
+              onClick={clearFilters}
+              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <X className="h-3 w-3" />
+              Clear
+            </button>
+          )}
         </div>
         <div className="flex items-center gap-2">
           {canAddRow && !showAddRow && (
@@ -466,6 +620,30 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
           )}
         </div>
       </div>
+
+      {showFilters && (
+        <div className="border-b border-border bg-muted/20 px-4 py-1.5">
+          <div className="flex flex-wrap items-center gap-2">
+            {columnNames.map((col) => (
+              <div key={col} className="flex items-center gap-1">
+                <label className="text-[10px] font-medium text-muted-foreground whitespace-nowrap">
+                  {col}:
+                </label>
+                <input
+                  type="text"
+                  value={columnFilters[col] ?? ""}
+                  onChange={(e) => handleFilterChange(col, e.target.value)}
+                  placeholder="filter..."
+                  className="w-24 rounded border border-border bg-background px-1.5 py-0.5 text-[11px] font-mono placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-primary"
+                />
+              </div>
+            ))}
+          </div>
+          <p className="mt-1 text-[10px] text-muted-foreground/60">
+            Type to filter (ILIKE). Use &quot;null&quot; or &quot;not null&quot; for NULL checks.
+          </p>
+        </div>
+      )}
 
       {showAddRow && (
         <div className="border-b border-border bg-muted/30 px-4 py-2">

@@ -52,8 +52,8 @@
 - [x] **Inline cell editing** — click a cell to edit its value, save with Enter, cancel with Escape
 - [x] **Add new row** — button to insert a blank row, fill in values, and INSERT
 - [x] **Delete row(s)** — select one or more rows and delete them
-- [ ] **Column sorting** — click column header to sort ASC/DESC
-- [ ] **Column filtering** — filter input per column or a WHERE clause helper
+- [x] **Column sorting** — click column header to sort ASC/DESC
+- [x] **Column filtering** — filter input per column or a WHERE clause helper
 - [ ] **Copy cell / row** — right-click to copy a cell value, or copy an entire row as JSON
 - [ ] **Data export** — export table data or query results to CSV, JSON, or SQL INSERT statements
 

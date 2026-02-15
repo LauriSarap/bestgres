@@ -119,3 +119,14 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--color-muted-foreground);
 }
+
+/* ── Checkbox styling ── */
+input[type="checkbox"] {
+  accent-color: var(--color-primary);
+  width: 14px;
+  height: 14px;
+}
+
+.dark input[type="checkbox"] {
+  color-scheme: dark;
+}
