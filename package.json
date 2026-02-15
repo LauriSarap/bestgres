@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:clean": "rm -rf src-tauri/target"
   },
   "dependencies": {
     "@tanstack/react-table": "^8.21.3",

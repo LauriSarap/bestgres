@@ -2,8 +2,10 @@ import React, { useRef } from "react";
 import {
   useReactTable,
   getCoreRowModel,
+  getFilteredRowModel,
   flexRender,
   type ColumnDef,
+  type RowSelectionState,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
@@ -12,12 +14,22 @@ interface DataGridProps<TData> {
   data: TData[];
   columns: ColumnDef<TData, unknown>[];
   className?: string;
+  /** When set, enables row selection with checkboxes */
+  rowSelection?: RowSelectionState;
+  onRowSelectionChange?: (
+    updater: RowSelectionState | ((old: RowSelectionState) => RowSelectionState)
+  ) => void;
+  /** Unique row id accessor for selection. Defaults to row index. */
+  getRowId?: (row: TData, index: number) => string;
 }
 
 export const DataGrid = React.memo(function DataGrid<TData>({
   data,
   columns,
   className,
+  rowSelection,
+  onRowSelectionChange,
+  getRowId = (_, i) => String(i),
 }: DataGridProps<TData>) {
   const parentRef = useRef<HTMLDivElement>(null);
 
@@ -25,6 +37,11 @@ export const DataGrid = React.memo(function DataGrid<TData>({
     data,
     columns,
     getCoreRowModel: getCoreRowModel(),
+    getFilteredRowModel: getFilteredRowModel(),
+    state: rowSelection !== undefined ? { rowSelection } : {},
+    onRowSelectionChange,
+    getRowId,
+    enableRowSelection: rowSelection !== undefined,
   });
 
   const { rows } = table.getRowModel();

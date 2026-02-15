@@ -1,6 +1,6 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Loader2, AlertCircle, Clock, Rows3, ChevronDown } from "lucide-react";
+import { Loader2, AlertCircle, Clock, Rows3, ChevronDown, Plus, Trash2 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { DataGrid } from "@/components/DataGrid";
 import { EditableCell } from "@/components/EditableCell";
@@ -25,6 +25,12 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [rowSelection, setRowSelection] = useState<Record<string, boolean>>({});
+  const [showAddRow, setShowAddRow] = useState(false);
+  const [draftValues, setDraftValues] = useState<Record<string, string>>({});
+  const [inserting, setInserting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [insertError, setInsertError] = useState<string | null>(null);
 
   // Initial load: count + first page + column info
   useEffect(() => {
@@ -38,6 +44,9 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
       setColumnTypes(new Map());
       setPrimaryKeyColumns([]);
       setTotalCount(null);
+      setShowAddRow(false);
+      setRowSelection({});
+      setInsertError(null);
 
       try {
         // Fire all four queries in parallel
@@ -115,6 +124,137 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     }
   }, [connectionId, database, schema, table, rows.length, loadingMore]);
 
+  const parseCellValue = useCallback((raw: string): string | number | boolean | null => {
+    const trimmed = raw.trim();
+    if (trimmed.toLowerCase() === "null" || trimmed === "") return null;
+    if (trimmed.toLowerCase() === "true") return true;
+    if (trimmed.toLowerCase() === "false") return false;
+    const num = Number(trimmed);
+    if (!Number.isNaN(num) && trimmed !== "") return num;
+    return trimmed;
+  }, []);
+
+  const handleInsert = useCallback(async () => {
+    const columns: string[] = [];
+    const values: (string | number | boolean | null)[] = [];
+    const types: string[] = [];
+    for (const col of columnNames) {
+      const raw = (draftValues[col] ?? "").trim();
+      if (raw === "") continue;
+      const parsed = parseCellValue(raw);
+      columns.push(col);
+      values.push(parsed);
+      types.push(columnTypes.get(col) ?? "text");
+    }
+    if (columns.length === 0) {
+      setInsertError("Fill in at least one column");
+      return;
+    }
+    setInsertError(null);
+    setInserting(true);
+    try {
+      await invoke("insert_row", {
+        connectionId,
+        database,
+        schema,
+        table,
+        columns,
+        values,
+        columnTypes: types,
+      });
+      setShowAddRow(false);
+      setDraftValues({});
+      setInsertError(null);
+      setTotalCount((c) => (c !== null ? c + 1 : null));
+      // Refetch first page to include the new row (order may vary)
+      const res = await invoke<QueryResult>("execute_query", {
+        connectionId,
+        database,
+        sql: `SELECT * FROM "${schema}"."${table}" LIMIT ${PAGE_SIZE}`,
+      });
+      setRows(res.rows);
+    } catch (err) {
+      setInsertError(String(err));
+    } finally {
+      setInserting(false);
+    }
+  }, [
+    connectionId,
+    database,
+    schema,
+    table,
+    columnNames,
+    columnTypes,
+    draftValues,
+    parseCellValue,
+  ]);
+
+  const handleDelete = useCallback(async () => {
+    const selectedIds = Object.entries(rowSelection)
+      .filter(([, v]) => v)
+      .map(([id]) => id);
+    if (selectedIds.length === 0) return;
+    const pkValuesList = selectedIds.map((id) => {
+      const parts = id.split("\x01");
+      return parts.map((p) => {
+        try {
+          return JSON.parse(p) as unknown;
+        } catch {
+          return p;
+        }
+      });
+    });
+    setDeleting(true);
+    setError(null);
+    try {
+      await invoke("delete_rows", {
+        connectionId,
+        database,
+        schema,
+        table,
+        primaryKeyColumns,
+        primaryKeyValuesList: pkValuesList,
+      });
+      setRowSelection({});
+      const indicesToRemove = new Set(
+        selectedIds.map((id) =>
+          rows.findIndex((row) => {
+            const pkVals = primaryKeyColumns.map((pk) => {
+              const colIdx = columnNames.indexOf(pk);
+              return colIdx >= 0 ? row[colIdx] : undefined;
+            });
+            return pkVals.map((v) => JSON.stringify(v ?? null)).join("\x01") === id;
+          })
+        )
+      );
+      setRows((prev) => prev.filter((_, i) => !indicesToRemove.has(i)));
+      setTotalCount((c) => (c !== null ? Math.max(0, c - selectedIds.length) : null));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setDeleting(false);
+    }
+  }, [
+    connectionId,
+    database,
+    schema,
+    table,
+    rowSelection,
+    primaryKeyColumns,
+    columnNames,
+    rows,
+  ]);
+
+  const getRowId = useCallback(
+    (row: Record<string, unknown>) => {
+      if (primaryKeyColumns.length === 0) return "";
+      return primaryKeyColumns
+        .map((pk) => JSON.stringify(row[pk] ?? null))
+        .join("\x01");
+    },
+    [primaryKeyColumns]
+  );
+
   const handleCellSave = useCallback(
     async (
       rowIndex: number,
@@ -166,10 +306,37 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     ]
   );
 
+  const selectionColumn: ColumnDef<Record<string, unknown>, unknown> | null =
+    primaryKeyColumns.length > 0
+      ? {
+          id: "select",
+          size: 32,
+          header: ({ table }) => (
+            <input
+              type="checkbox"
+              checked={table.getIsAllRowsSelected()}
+              ref={(el) => {
+                if (el) el.indeterminate = table.getIsSomeRowsSelected();
+              }}
+              onChange={table.getToggleAllRowsSelectedHandler()}
+              className="cursor-pointer"
+            />
+          ),
+          cell: ({ row }) => (
+            <input
+              type="checkbox"
+              checked={row.getIsSelected()}
+              onChange={row.getToggleSelectedHandler()}
+              className="cursor-pointer"
+            />
+          ),
+        }
+      : null;
+
   const columns: ColumnDef<Record<string, unknown>, unknown>[] = useMemo(() => {
     if (columnNames.length === 0) return [];
     const canEdit = primaryKeyColumns.length > 0;
-    return columnNames.map((col) => {
+    const dataCols = columnNames.map((col) => {
       const isPk = primaryKeyColumns.includes(col);
       const editable = canEdit && !isPk;
       return {
@@ -184,7 +351,13 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
             )}
           </div>
         ),
-        cell: ({ getValue, row }) => {
+        cell: ({
+          getValue,
+          row,
+        }: {
+          getValue: () => unknown;
+          row: { index: number };
+        }) => {
           const v = getValue();
           const rowIndex = row.index;
           if (editable) {
@@ -208,11 +381,13 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
         },
       };
     });
+    return selectionColumn ? [selectionColumn, ...dataCols] : dataCols;
   }, [
     columnNames,
     columnTypes,
     primaryKeyColumns,
     handleCellSave,
+    selectionColumn,
   ]);
 
   const data: Record<string, unknown>[] = useMemo(() => {
@@ -245,19 +420,117 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     );
   }
 
+  const selectedCount = Object.values(rowSelection).filter(Boolean).length;
+  const canAddRow = primaryKeyColumns.length > 0;
+  const canDelete = primaryKeyColumns.length > 0 && selectedCount > 0;
+
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-4 border-b border-border px-4 py-1.5 text-xs text-muted-foreground">
-        <span className="flex items-center gap-1">
-          <Rows3 className="h-3 w-3" />
-          {rows.length}{totalCount !== null ? ` / ${totalCount}` : ""} rows
-        </span>
-        <span className="flex items-center gap-1">
-          <Clock className="h-3 w-3" />
-          {execTime}ms
-        </span>
+      <div className="flex items-center justify-between gap-4 border-b border-border px-4 py-1.5 text-xs text-muted-foreground">
+        <div className="flex items-center gap-4">
+          <span className="flex items-center gap-1">
+            <Rows3 className="h-3 w-3" />
+            {rows.length}{totalCount !== null ? ` / ${totalCount}` : ""} rows
+          </span>
+          <span className="flex items-center gap-1">
+            <Clock className="h-3 w-3" />
+            {execTime}ms
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          {canAddRow && !showAddRow && (
+            <button
+              onClick={() => {
+                setShowAddRow(true);
+                setInsertError(null);
+              }}
+              className="flex items-center gap-1.5 rounded-md bg-secondary px-2 py-1 text-xs font-medium text-secondary-foreground hover:bg-accent transition-colors"
+            >
+              <Plus className="h-3 w-3" />
+              Add row
+            </button>
+          )}
+          {canDelete && (
+            <button
+              onClick={handleDelete}
+              disabled={deleting}
+              className="flex items-center gap-1.5 rounded-md bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive hover:bg-destructive/20 disabled:opacity-50 transition-colors"
+            >
+              {deleting ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <Trash2 className="h-3 w-3" />
+              )}
+              Delete {selectedCount} {selectedCount === 1 ? "row" : "rows"}
+            </button>
+          )}
+        </div>
       </div>
-      <DataGrid data={data} columns={columns} className="flex-1" />
+
+      {showAddRow && (
+        <div className="border-b border-border bg-muted/30 px-4 py-2">
+          {insertError && (
+            <div className="mb-2 text-xs text-destructive">{insertError}</div>
+          )}
+          <div className="flex flex-wrap items-end gap-3">
+            {columnNames.map((col) => (
+              <div key={col} className="flex flex-col gap-0.5">
+                <label className="text-[10px] font-medium text-muted-foreground">
+                  {col}
+                </label>
+                <input
+                  type="text"
+                  value={draftValues[col] ?? ""}
+                  onChange={(e) =>
+                    setDraftValues((prev) => ({ ...prev, [col]: e.target.value }))
+                  }
+                  placeholder="NULL"
+                  className="min-w-[100px] rounded border border-border bg-background px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-primary"
+                />
+              </div>
+            ))}
+            <div className="flex gap-2">
+              <button
+                onClick={handleInsert}
+                disabled={inserting}
+                className="flex items-center gap-1.5 rounded-md bg-primary px-2 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+              >
+                {inserting ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                Insert
+              </button>
+              <button
+                onClick={() => {
+                  setShowAddRow(false);
+                  setDraftValues({});
+                  setInsertError(null);
+                }}
+                disabled={inserting}
+                className="rounded-md bg-secondary px-2 py-1 text-xs font-medium text-secondary-foreground hover:bg-accent disabled:opacity-50 transition-colors"
+              >
+                Discard
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <DataGrid
+        data={data}
+        columns={columns}
+        className="flex-1"
+        rowSelection={canAddRow ? rowSelection : undefined}
+        onRowSelectionChange={
+          canAddRow
+            ? (updater) =>
+                setRowSelection((prev) => {
+                  const next =
+                    typeof updater === "function" ? updater(prev) : updater;
+                  return next ?? {};
+                })
+            : undefined
+        }
+        getRowId={(row) => getRowId(row)}
+      />
       {hasMore && (
         <div className="flex items-center justify-center border-t border-border py-2">
           <button

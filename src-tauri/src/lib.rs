@@ -25,6 +25,8 @@ pub fn run() {
             commands::query::get_table_structure,
             commands::query::execute_query,
             commands::query::update_cell,
+            commands::query::insert_row,
+            commands::query::delete_rows,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

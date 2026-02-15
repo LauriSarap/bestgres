@@ -24,6 +24,13 @@ npm run tauri dev
 npm run tauri build
 ```
 
+## Troubleshooting
+
+**proc-macro error in IDE** (`Cannot create expander for libtauri_macros-*.so`):
+
+1. Fix build: `npm run tauri:clean` then `npm run tauri dev`
+2. Fix IDE (rust-analyzer): `Ctrl+Shift+P` → **"rust-analyzer: Restart Server"** (or **"Developer: Reload Window"**)
+
 ## Project Structure
 
 ```

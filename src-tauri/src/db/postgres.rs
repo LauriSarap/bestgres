@@ -411,6 +411,180 @@ pub async fn update_cell(
     Ok(result.rows_affected())
 }
 
+/// Map information_schema data_type to PostgreSQL cast for text-bound params.
+fn sql_cast_for_type(data_type: &str) -> Option<&'static str> {
+    let t = data_type.to_lowercase();
+    if t.contains("timestamp with time zone") || t == "timestamptz" {
+        return Some("timestamptz");
+    }
+    if t.contains("timestamp without time zone")
+        || t == "timestamp"
+        || (t.contains("timestamp") && !t.contains("with"))
+    {
+        return Some("timestamp");
+    }
+    if t == "date" {
+        return Some("date");
+    }
+    if t.contains("time with time zone") || t == "timetz" {
+        return Some("timetz");
+    }
+    if t.contains("time without time zone") || t == "time" {
+        return Some("time");
+    }
+    if t == "json" {
+        return Some("json");
+    }
+    if t == "jsonb" {
+        return Some("jsonb");
+    }
+    if t == "uuid" {
+        return Some("uuid");
+    }
+    if t == "boolean" || t == "bool" {
+        return Some("boolean");
+    }
+    if t == "integer" || t == "int" || t == "int4" {
+        return Some("integer");
+    }
+    if t == "bigint" || t == "int8" {
+        return Some("bigint");
+    }
+    if t == "smallint" || t == "int2" {
+        return Some("smallint");
+    }
+    if t == "real" || t == "float4" {
+        return Some("real");
+    }
+    if t == "double precision" || t == "float8" {
+        return Some("double precision");
+    }
+    if t == "numeric" || t == "decimal" {
+        return Some("numeric");
+    }
+    None
+}
+
+/// Insert a new row. Columns and values must match in length.
+/// Values are bound as parameters. Use JsonValue::Null for NULL.
+/// column_types: info_schema data_type per column, used for proper casts (timestamptz, etc.).
+pub async fn insert_row(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    values: &[serde_json::Value],
+    column_types: &[String],
+) -> Result<u64, AppError> {
+    if !is_valid_identifier(schema) || !is_valid_identifier(table) {
+        return Err(AppError::Database("Invalid identifier".into()));
+    }
+    if columns.len() != values.len() {
+        return Err(AppError::Database("Column/value count mismatch".into()));
+    }
+    if columns.is_empty() {
+        return Err(AppError::Database("No columns specified".into()));
+    }
+    for col in columns {
+        if !is_valid_identifier(col) {
+            return Err(AppError::Database("Invalid column name".into()));
+        }
+    }
+
+    let col_list: Vec<String> = columns.iter().map(|c| format!(r#""{}""#, c)).collect();
+    let placeholders: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let param = format!("${}", i + 1);
+            let cast = column_types
+                .get(i)
+                .and_then(|t| sql_cast_for_type(t));
+            match cast {
+                Some(c) => format!("{}::{}", param, c),
+                None => param,
+            }
+        })
+        .collect();
+    let sql = format!(
+        r#"INSERT INTO "{}"."{}" ({}) VALUES ({})"#,
+        schema,
+        table,
+        col_list.join(", "),
+        placeholders.join(", ")
+    );
+
+    let mut q = sqlx::query(&sql);
+    for v in values {
+        q = q.bind(serde_json_value_to_sql(v));
+    }
+
+    let result = q.execute(pool).await.map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(result.rows_affected())
+}
+
+/// Delete rows by primary key. Each inner vec is one row's PK values.
+pub async fn delete_rows(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+    primary_key_columns: &[String],
+    primary_key_values_list: &[Vec<serde_json::Value>],
+) -> Result<u64, AppError> {
+    if !is_valid_identifier(schema) || !is_valid_identifier(table) {
+        return Err(AppError::Database("Invalid identifier".into()));
+    }
+    if primary_key_columns.is_empty() {
+        return Err(AppError::Database("Table has no primary key; cannot delete".into()));
+    }
+    for pk_col in primary_key_columns {
+        if !is_valid_identifier(pk_col) {
+            return Err(AppError::Database("Invalid primary key column name".into()));
+        }
+    }
+    if primary_key_values_list.is_empty() {
+        return Ok(0);
+    }
+
+    let pk_cols_quoted: Vec<String> = primary_key_columns
+        .iter()
+        .map(|c| format!(r#""{}""#, c))
+        .collect();
+    let pk_tuple = format!("({})", pk_cols_quoted.join(", "));
+
+    let mut param_idx = 1u32;
+    let mut value_tuples = Vec::with_capacity(primary_key_values_list.len());
+    for row_vals in primary_key_values_list {
+        if row_vals.len() != primary_key_columns.len() {
+            return Err(AppError::Database("Primary key value count mismatch".into()));
+        }
+        let placeholders: Vec<String> = (0..row_vals.len())
+            .map(|_| {
+                let s = format!("${}", param_idx);
+                param_idx += 1;
+                s
+            })
+            .collect();
+        value_tuples.push(format!("({})", placeholders.join(", ")));
+    }
+
+    let in_clause = value_tuples.join(", ");
+    let sql = format!(
+        r#"DELETE FROM "{}"."{}" WHERE {} IN ({})"#,
+        schema, table, pk_tuple, in_clause
+    );
+
+    let mut q = sqlx::query(&sql);
+    for row_vals in primary_key_values_list {
+        for v in row_vals {
+            q = q.bind(serde_json_value_to_sql(v));
+        }
+    }
+
+    let result = q.execute(pool).await.map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(result.rows_affected())
+}
+
 /// Convert serde_json::Value to a type sqlx can bind.
 /// We use a custom enum/struct to handle the variety of types.
 fn serde_json_value_to_sql(v: &serde_json::Value) -> Option<String> {

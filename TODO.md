@@ -50,8 +50,8 @@
 - [x] NULL display (italic muted placeholder)
 - [x] JSON/JSONB columns rendered as `JSON.stringify` instead of `[object Object]`
 - [x] **Inline cell editing** — click a cell to edit its value, save with Enter, cancel with Escape
-- [ ] **Add new row** — button to insert a blank row, fill in values, and INSERT
-- [ ] **Delete row(s)** — select one or more rows and delete them
+- [x] **Add new row** — button to insert a blank row, fill in values, and INSERT
+- [x] **Delete row(s)** — select one or more rows and delete them
 - [ ] **Column sorting** — click column header to sort ASC/DESC
 - [ ] **Column filtering** — filter input per column or a WHERE clause helper
 - [ ] **Copy cell / row** — right-click to copy a cell value, or copy an entire row as JSON
