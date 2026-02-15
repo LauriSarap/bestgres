@@ -47,16 +47,6 @@ npm run tauri dev       # dev mode
 npm run tauri build     # local production build
 ```
 
-## Releasing
-
-Push to the `release` branch to trigger a cross-platform build via GitHub Actions:
-
-```bash
-git push origin main:release
-```
-
-This builds for Linux, Windows, and macOS, then creates a draft GitHub Release with all installers attached. Review and publish from the Releases page.
-
 ## Project Structure
 
 ```
