@@ -13,6 +13,7 @@ import {
   TerminalSquare,
   Loader2,
   Pencil,
+  Trash2,
   HardDrive,
   RefreshCw,
   FileCode,
@@ -27,6 +28,7 @@ interface SidebarProps {
   onSelectConnection: (id: string) => void;
   onAddConnection: () => void;
   onEditConnection: (conn: ConnectionEntry) => void;
+  onDeleteConnection: (conn: ConnectionEntry) => void;
   onOpenTable: (connectionId: string, database: string, schema: string, table: string) => void;
   onOpenStructure: (connectionId: string, database: string, schema: string, table: string) => void;
   onOpenQuery: (connectionId: string, database: string) => void;
@@ -41,6 +43,7 @@ export function Sidebar({
   onSelectConnection,
   onAddConnection,
   onEditConnection,
+  onDeleteConnection,
   onOpenTable,
   onOpenStructure,
   onOpenQuery,
@@ -249,6 +252,16 @@ export function Sidebar({
                     title="Edit connection"
                   >
                     <Pencil className="h-3 w-3" />
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeleteConnection(conn);
+                    }}
+                    className="mr-1 rounded p-1 text-muted-foreground opacity-0 hover:bg-destructive/20 hover:text-destructive group-hover:opacity-100 transition-opacity"
+                    title="Delete connection"
+                  >
+                    <Trash2 className="h-3 w-3" />
                   </button>
                 </div>
 

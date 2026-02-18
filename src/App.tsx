@@ -185,6 +185,32 @@ function AppInner() {
     setDialogOpen(true);
   }, []);
 
+  const handleDeleteConnection = useCallback(
+    async (conn: ConnectionEntry) => {
+      if (!window.confirm(`Delete connection "${conn.name}"? This will close any open tabs for this connection.`)) {
+        return;
+      }
+      try {
+        await invoke("remove_connection", { connectionId: conn.id });
+        const nextConnections = connections.filter((c) => c.id !== conn.id);
+        const nextTabs = tabs.filter((t) => t.connectionId !== conn.id);
+        setConnections(nextConnections);
+        setTabs(nextTabs);
+        const activeTabWasRemoved = tabs.some((t) => t.id === activeTabId && t.connectionId === conn.id);
+        if (activeTabWasRemoved) {
+          setActiveTabId(nextTabs.length > 0 ? nextTabs[0].id : null);
+        }
+        if (activeConnectionId === conn.id) {
+          setActiveConnectionId(nextConnections[0]?.id ?? null);
+        }
+        toast("success", `Deleted ${conn.name}`);
+      } catch (err) {
+        toast("error", String(err));
+      }
+    },
+    [activeConnectionId, activeTabId, connections, tabs, toast]
+  );
+
   const closeDialog = useCallback(() => {
     setDialogOpen(false);
     setEditingConnection(null);
@@ -309,6 +335,7 @@ function AppInner() {
         onSelectConnection={handleSelectConnection}
         onAddConnection={openAddDialog}
         onEditConnection={openEditDialog}
+        onDeleteConnection={handleDeleteConnection}
         onOpenTable={handleOpenTable}
         onOpenStructure={handleOpenStructure}
         onOpenQuery={handleOpenQuery}
