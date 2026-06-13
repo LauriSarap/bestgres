@@ -349,14 +349,59 @@ pub async fn get_primary_key_columns(
     Ok(rows.iter().map(|r| r.get("column_name")).collect())
 }
 
-/// Validate that a string is a safe PostgreSQL identifier (for schema, table, column).
-fn is_valid_identifier(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && s.chars().next().map(|c| !c.is_ascii_digit()).unwrap_or(false)
+/// Quote a PostgreSQL identifier, escaping embedded double quotes.
+fn quote_ident(s: &str) -> String {
+    format!(r#""{}""#, s.replace('"', r#""""#))
 }
 
-/// Update a single cell value. Uses parameterized queries for values; validates identifiers.
+fn check_ident(s: &str) -> Result<(), AppError> {
+    if s.is_empty() || s.contains('\0') {
+        return Err(AppError::Database("Invalid identifier".into()));
+    }
+    Ok(())
+}
+
+/// Fetch the base type (without typmod) of every column in a table, keyed by column name.
+/// Used to cast text-bound parameters to the column's real type in UPDATE/INSERT/DELETE.
+/// The typmod is dropped on purpose: casting to e.g. varchar(3) would silently truncate,
+/// while assignment to the column still enforces the length.
+async fn get_column_types(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+) -> Result<std::collections::HashMap<String, String>, AppError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT a.attname AS name, format_type(a.atttypid, NULL) AS data_type
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("data_type")))
+        .collect())
+}
+
+/// Build a `$N::type` placeholder. Without a known type the bare placeholder is
+/// bound as text, which only works for text-like columns.
+fn typed_placeholder(idx: u32, col: &str, types: &std::collections::HashMap<String, String>) -> String {
+    match types.get(col) {
+        Some(t) => format!("${}::{}", idx, t),
+        None => format!("${}", idx),
+    }
+}
+
+/// Update a single cell value. Values are bound as text and cast to the column's
+/// actual type server-side, so editing works for any column type.
 pub async fn update_cell(
     pool: &PgPool,
     schema: &str,
@@ -366,9 +411,9 @@ pub async fn update_cell(
     primary_key_values: &[serde_json::Value],
     new_value: &serde_json::Value,
 ) -> Result<u64, AppError> {
-    if !is_valid_identifier(schema) || !is_valid_identifier(table) || !is_valid_identifier(column) {
-        return Err(AppError::Database("Invalid identifier".into()));
-    }
+    check_ident(schema)?;
+    check_ident(table)?;
+    check_ident(column)?;
     if primary_key_columns.is_empty() {
         return Err(AppError::Database("Table has no primary key; cannot update".into()));
     }
@@ -376,109 +421,49 @@ pub async fn update_cell(
         return Err(AppError::Database("Primary key column/value count mismatch".into()));
     }
     for pk_col in primary_key_columns {
-        if !is_valid_identifier(pk_col) {
-            return Err(AppError::Database("Invalid primary key column name".into()));
-        }
+        check_ident(pk_col)?;
     }
 
-    // Build: UPDATE "schema"."table" SET "column" = $1 WHERE "pk1" = $2 AND "pk2" = $3 ...
-    let set_clause = format!(r#""{}" = $1"#, column);
-    let mut param_idx = 2u32;
-    let where_parts: Vec<String> = primary_key_columns
+    let types = get_column_types(pool, schema, table).await?;
+
+    // UPDATE "schema"."table" SET "column" = $1::type WHERE "pk1" = $2::type AND ...
+    let set_clause = format!("{} = {}", quote_ident(column), typed_placeholder(1, column, &types));
+    let where_clause = primary_key_columns
         .iter()
-        .map(|c| {
-            let part = format!(r#""{}" = ${}"#, c, param_idx);
-            param_idx += 1;
-            part
-        })
-        .collect();
-    let where_clause = where_parts.join(" AND ");
+        .enumerate()
+        .map(|(i, c)| format!("{} = {}", quote_ident(c), typed_placeholder(i as u32 + 2, c, &types)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
     let sql = format!(
-        r#"UPDATE "{}"."{}" SET {} WHERE {}"#,
-        schema,
-        table,
+        "UPDATE {}.{} SET {} WHERE {}",
+        quote_ident(schema),
+        quote_ident(table),
         set_clause,
         where_clause
     );
 
     let mut q = sqlx::query(&sql).bind(serde_json_value_to_sql(new_value));
-
     for v in primary_key_values {
         q = q.bind(serde_json_value_to_sql(v));
     }
 
     let result = q.execute(pool).await.map_err(|e| AppError::Database(e.to_string()))?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::Database("No row matched the primary key; nothing updated".into()));
+    }
     Ok(result.rows_affected())
 }
 
-/// Map information_schema data_type to PostgreSQL cast for text-bound params.
-fn sql_cast_for_type(data_type: &str) -> Option<&'static str> {
-    let t = data_type.to_lowercase();
-    if t.contains("timestamp with time zone") || t == "timestamptz" {
-        return Some("timestamptz");
-    }
-    if t.contains("timestamp without time zone")
-        || t == "timestamp"
-        || (t.contains("timestamp") && !t.contains("with"))
-    {
-        return Some("timestamp");
-    }
-    if t == "date" {
-        return Some("date");
-    }
-    if t.contains("time with time zone") || t == "timetz" {
-        return Some("timetz");
-    }
-    if t.contains("time without time zone") || t == "time" {
-        return Some("time");
-    }
-    if t == "json" {
-        return Some("json");
-    }
-    if t == "jsonb" {
-        return Some("jsonb");
-    }
-    if t == "uuid" {
-        return Some("uuid");
-    }
-    if t == "boolean" || t == "bool" {
-        return Some("boolean");
-    }
-    if t == "integer" || t == "int" || t == "int4" {
-        return Some("integer");
-    }
-    if t == "bigint" || t == "int8" {
-        return Some("bigint");
-    }
-    if t == "smallint" || t == "int2" {
-        return Some("smallint");
-    }
-    if t == "real" || t == "float4" {
-        return Some("real");
-    }
-    if t == "double precision" || t == "float8" {
-        return Some("double precision");
-    }
-    if t == "numeric" || t == "decimal" {
-        return Some("numeric");
-    }
-    None
-}
-
-/// Insert a new row. Columns and values must match in length.
-/// Values are bound as parameters. Use JsonValue::Null for NULL.
-/// column_types: info_schema data_type per column, used for proper casts (timestamptz, etc.).
+/// Insert a new row. Values are bound as text and cast to each column's actual type.
 pub async fn insert_row(
     pool: &PgPool,
     schema: &str,
     table: &str,
     columns: &[String],
     values: &[serde_json::Value],
-    column_types: &[String],
 ) -> Result<u64, AppError> {
-    if !is_valid_identifier(schema) || !is_valid_identifier(table) {
-        return Err(AppError::Database("Invalid identifier".into()));
-    }
+    check_ident(schema)?;
+    check_ident(table)?;
     if columns.len() != values.len() {
         return Err(AppError::Database("Column/value count mismatch".into()));
     }
@@ -486,30 +471,21 @@ pub async fn insert_row(
         return Err(AppError::Database("No columns specified".into()));
     }
     for col in columns {
-        if !is_valid_identifier(col) {
-            return Err(AppError::Database("Invalid column name".into()));
-        }
+        check_ident(col)?;
     }
 
-    let col_list: Vec<String> = columns.iter().map(|c| format!(r#""{}""#, c)).collect();
+    let types = get_column_types(pool, schema, table).await?;
+
+    let col_list: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
     let placeholders: Vec<String> = columns
         .iter()
         .enumerate()
-        .map(|(i, _)| {
-            let param = format!("${}", i + 1);
-            let cast = column_types
-                .get(i)
-                .and_then(|t| sql_cast_for_type(t));
-            match cast {
-                Some(c) => format!("{}::{}", param, c),
-                None => param,
-            }
-        })
+        .map(|(i, col)| typed_placeholder(i as u32 + 1, col, &types))
         .collect();
     let sql = format!(
-        r#"INSERT INTO "{}"."{}" ({}) VALUES ({})"#,
-        schema,
-        table,
+        "INSERT INTO {}.{} ({}) VALUES ({})",
+        quote_ident(schema),
+        quote_ident(table),
         col_list.join(", "),
         placeholders.join(", ")
     );
@@ -531,25 +507,21 @@ pub async fn delete_rows(
     primary_key_columns: &[String],
     primary_key_values_list: &[Vec<serde_json::Value>],
 ) -> Result<u64, AppError> {
-    if !is_valid_identifier(schema) || !is_valid_identifier(table) {
-        return Err(AppError::Database("Invalid identifier".into()));
-    }
+    check_ident(schema)?;
+    check_ident(table)?;
     if primary_key_columns.is_empty() {
         return Err(AppError::Database("Table has no primary key; cannot delete".into()));
     }
     for pk_col in primary_key_columns {
-        if !is_valid_identifier(pk_col) {
-            return Err(AppError::Database("Invalid primary key column name".into()));
-        }
+        check_ident(pk_col)?;
     }
     if primary_key_values_list.is_empty() {
         return Ok(0);
     }
 
-    let pk_cols_quoted: Vec<String> = primary_key_columns
-        .iter()
-        .map(|c| format!(r#""{}""#, c))
-        .collect();
+    let types = get_column_types(pool, schema, table).await?;
+
+    let pk_cols_quoted: Vec<String> = primary_key_columns.iter().map(|c| quote_ident(c)).collect();
     let pk_tuple = format!("({})", pk_cols_quoted.join(", "));
 
     let mut param_idx = 1u32;
@@ -558,9 +530,10 @@ pub async fn delete_rows(
         if row_vals.len() != primary_key_columns.len() {
             return Err(AppError::Database("Primary key value count mismatch".into()));
         }
-        let placeholders: Vec<String> = (0..row_vals.len())
-            .map(|_| {
-                let s = format!("${}", param_idx);
+        let placeholders: Vec<String> = primary_key_columns
+            .iter()
+            .map(|col| {
+                let s = typed_placeholder(param_idx, col, &types);
                 param_idx += 1;
                 s
             })
@@ -570,8 +543,11 @@ pub async fn delete_rows(
 
     let in_clause = value_tuples.join(", ");
     let sql = format!(
-        r#"DELETE FROM "{}"."{}" WHERE {} IN ({})"#,
-        schema, table, pk_tuple, in_clause
+        "DELETE FROM {}.{} WHERE {} IN ({})",
+        quote_ident(schema),
+        quote_ident(table),
+        pk_tuple,
+        in_clause
     );
 
     let mut q = sqlx::query(&sql);
@@ -599,76 +575,221 @@ fn serde_json_value_to_sql(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Execute an arbitrary SQL query and return results as JSON values.
-pub async fn execute_query(pool: &PgPool, sql: &str) -> Result<QueryResult, AppError> {
+/// Decode a single cell into a JSON value for the frontend.
+/// NULL is detected explicitly; then types are tried from most to least common.
+/// Values we can't decode are surfaced as "<typename>" placeholders instead of
+/// being silently shown as NULL.
+fn decode_cell(row: &sqlx::postgres::PgRow, i: usize) -> serde_json::Value {
+    use sqlx::TypeInfo;
+    use sqlx::ValueRef;
+
+    match row.try_get_raw(i) {
+        Ok(raw) if raw.is_null() => return serde_json::Value::Null,
+        Err(_) => return serde_json::Value::Null,
+        _ => {}
+    }
+
+    if let Ok(v) = row.try_get::<String, _>(i) {
+        serde_json::Value::String(v)
+    } else if let Ok(v) = row.try_get::<bool, _>(i) {
+        serde_json::json!(v)
+    } else if let Ok(v) = row.try_get::<i16, _>(i) {
+        serde_json::json!(v)
+    } else if let Ok(v) = row.try_get::<i32, _>(i) {
+        serde_json::json!(v)
+    } else if let Ok(v) = row.try_get::<i64, _>(i) {
+        json_i64(v)
+    } else if let Ok(v) = row.try_get::<f32, _>(i) {
+        serde_json::json!(v)
+    } else if let Ok(v) = row.try_get::<f64, _>(i) {
+        serde_json::json!(v)
+    } else if let Ok(v) = row.try_get::<rust_decimal::Decimal, _>(i) {
+        // String keeps full precision; JS numbers would round large decimals
+        serde_json::Value::String(v.to_string())
+    } else if let Ok(v) = row.try_get::<uuid::Uuid, _>(i) {
+        serde_json::Value::String(v.to_string())
+    } else if let Ok(v) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(i) {
+        serde_json::Value::String(v.to_rfc3339())
+    } else if let Ok(v) = row.try_get::<chrono::NaiveDateTime, _>(i) {
+        serde_json::Value::String(v.to_string())
+    } else if let Ok(v) = row.try_get::<chrono::NaiveDate, _>(i) {
+        serde_json::Value::String(v.to_string())
+    } else if let Ok(v) = row.try_get::<chrono::NaiveTime, _>(i) {
+        serde_json::Value::String(v.to_string())
+    } else if let Ok(v) = row.try_get::<serde_json::Value, _>(i) {
+        v
+    } else if let Ok(v) = row.try_get::<sqlx::types::ipnetwork::IpNetwork, _>(i) {
+        serde_json::Value::String(v.to_string())
+    } else if let Ok(v) = row.try_get::<sqlx::types::mac_address::MacAddress, _>(i) {
+        serde_json::Value::String(v.to_string())
+    } else if let Ok(v) = row.try_get::<sqlx::postgres::types::PgInterval, _>(i) {
+        serde_json::Value::String(format_interval(&v))
+    } else if let Ok(v) = row.try_get::<Vec<u8>, _>(i) {
+        serde_json::Value::String(format!("\\x{}", hex_encode(&v)))
+    } else if let Ok(v) = row.try_get::<Vec<String>, _>(i) {
+        serde_json::json!(v)
+    } else if let Ok(v) = row.try_get::<Vec<i32>, _>(i) {
+        serde_json::json!(v)
+    } else if let Ok(v) = row.try_get::<Vec<i64>, _>(i) {
+        serde_json::Value::Array(v.into_iter().map(json_i64).collect())
+    } else if let Ok(v) = row.try_get::<Vec<f64>, _>(i) {
+        serde_json::json!(v)
+    } else if let Ok(v) = row.try_get::<Vec<bool>, _>(i) {
+        serde_json::json!(v)
+    } else if let Ok(v) = row.try_get_unchecked::<String, _>(i) {
+        // Last resort for text-compatible wire formats: enums, citext, domains, etc.
+        serde_json::Value::String(v)
+    } else {
+        let type_name = row.column(i).type_info().name().to_string();
+        serde_json::Value::String(format!("<{}>", type_name.to_lowercase()))
+    }
+}
+
+/// JS numbers lose precision past 2^53 - 1, so bigints outside the safe
+/// range are sent as strings.
+fn json_i64(v: i64) -> serde_json::Value {
+    const JS_MAX_SAFE: i64 = 9_007_199_254_740_991;
+    if (-JS_MAX_SAFE..=JS_MAX_SAFE).contains(&v) {
+        serde_json::json!(v)
+    } else {
+        serde_json::Value::String(v.to_string())
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn format_interval(v: &sqlx::postgres::types::PgInterval) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if v.months != 0 {
+        parts.push(format!("{} mon", v.months));
+    }
+    if v.days != 0 {
+        parts.push(format!("{} days", v.days));
+    }
+    let total_secs = v.microseconds / 1_000_000;
+    let micros = (v.microseconds % 1_000_000).abs();
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600).abs() / 60;
+    let secs = (total_secs % 60).abs();
+    if v.microseconds != 0 || parts.is_empty() {
+        if micros != 0 {
+            parts.push(format!("{:02}:{:02}:{:02}.{:06}", hours, mins, secs, micros));
+        } else {
+            parts.push(format!("{:02}:{:02}:{:02}", hours, mins, secs));
+        }
+    }
+    parts.join(" ")
+}
+
+/// Hard cap on rows returned to the frontend per statement. Results beyond
+/// this are dropped and the result is flagged `truncated`.
+pub const MAX_QUERY_ROWS: usize = 5000;
+
+/// Execute SQL and return results as JSON values.
+///
+/// With `params`, the SQL is run as a single parameterized statement
+/// ($1, $2, ... bound as text). Without params, the input may contain
+/// multiple semicolon-separated statements: they run sequentially, the last
+/// result set is returned, and `rows_affected` is summed across statements.
+pub async fn execute_query(
+    pool: &PgPool,
+    sql: &str,
+    params: &[serde_json::Value],
+) -> Result<QueryResult, AppError> {
     let start = std::time::Instant::now();
 
-    let rows = sqlx::query(sql)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let execution_time_ms = start.elapsed().as_millis() as u64;
-
-    let columns: Vec<String> = if let Some(first_row) = rows.first() {
-        first_row
-            .columns()
-            .iter()
-            .map(|c| c.name().to_string())
-            .collect()
+    let mut result = if !params.is_empty() {
+        run_statement(pool, sql, params).await?
     } else {
-        Vec::new()
+        let statements = crate::db::sql_split::split_statements(sql);
+        if statements.is_empty() {
+            return Err(AppError::Database("Empty query".into()));
+        }
+        let total = statements.len();
+        let mut shown: Option<QueryResult> = None;
+        let mut total_affected = 0u64;
+        for (idx, stmt) in statements.iter().enumerate() {
+            let res = run_statement(pool, stmt, &[]).await.map_err(|e| {
+                if total > 1 {
+                    AppError::Database(format!("Statement {} of {}: {}", idx + 1, total, e))
+                } else {
+                    e
+                }
+            })?;
+            total_affected += res.rows_affected;
+            // Show the result set of the last statement that produced columns
+            if !res.columns.is_empty() || shown.is_none() {
+                shown = Some(res);
+            }
+        }
+        let mut r = shown.expect("at least one statement ran");
+        r.rows_affected = total_affected;
+        r
     };
 
-    let result_rows: Vec<Vec<serde_json::Value>> = rows
-        .iter()
-        .map(|row| {
-            columns
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    // Try types from most common to least common.
-                    // String covers text, varchar, char, etc.
-                    if let Ok(v) = row.try_get::<String, _>(i) {
-                        serde_json::Value::String(v)
-                    } else if let Ok(v) = row.try_get::<bool, _>(i) {
-                        serde_json::json!(v)
-                    } else if let Ok(v) = row.try_get::<i16, _>(i) {
-                        serde_json::json!(v)
-                    } else if let Ok(v) = row.try_get::<i32, _>(i) {
-                        serde_json::json!(v)
-                    } else if let Ok(v) = row.try_get::<i64, _>(i) {
-                        serde_json::json!(v)
-                    } else if let Ok(v) = row.try_get::<f32, _>(i) {
-                        serde_json::json!(v)
-                    } else if let Ok(v) = row.try_get::<f64, _>(i) {
-                        serde_json::json!(v)
-                    } else if let Ok(v) = row.try_get::<uuid::Uuid, _>(i) {
-                        serde_json::Value::String(v.to_string())
-                    } else if let Ok(v) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(i) {
-                        serde_json::Value::String(v.to_rfc3339())
-                    } else if let Ok(v) = row.try_get::<chrono::NaiveDateTime, _>(i) {
-                        serde_json::Value::String(v.to_string())
-                    } else if let Ok(v) = row.try_get::<chrono::NaiveDate, _>(i) {
-                        serde_json::Value::String(v.to_string())
-                    } else if let Ok(v) = row.try_get::<chrono::NaiveTime, _>(i) {
-                        serde_json::Value::String(v.to_string())
-                    } else if let Ok(v) = row.try_get::<serde_json::Value, _>(i) {
-                        v
-                    } else {
-                        serde_json::Value::Null
-                    }
-                })
-                .collect()
-        })
-        .collect();
+    result.execution_time_ms = start.elapsed().as_millis() as u64;
+    Ok(result)
+}
+
+/// Run a single statement, streaming rows so huge result sets don't exhaust
+/// memory: reading stops at MAX_QUERY_ROWS and the rest is discarded.
+async fn run_statement(
+    pool: &PgPool,
+    sql: &str,
+    params: &[serde_json::Value],
+) -> Result<QueryResult, AppError> {
+    use futures_util::TryStreamExt;
+
+    let mut q = sqlx::query(sql);
+    for p in params {
+        q = q.bind(serde_json_value_to_sql(p));
+    }
+
+    // fetch_many is the only stream yielding both rows and affected-row counts.
+    // Deprecated over SQLite multi-statement semantics, which don't apply here:
+    // each call receives exactly one statement.
+    #[allow(deprecated)]
+    let mut stream = q.fetch_many(pool);
+    let mut columns: Vec<String> = Vec::new();
+    let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut rows_affected = 0u64;
+    let mut truncated = false;
+
+    while let Some(item) = stream
+        .try_next()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+    {
+        match item {
+            sqlx::Either::Left(done) => rows_affected += done.rows_affected(),
+            sqlx::Either::Right(row) => {
+                if columns.is_empty() {
+                    columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+                }
+                if result_rows.len() >= MAX_QUERY_ROWS {
+                    truncated = true;
+                    break;
+                }
+                result_rows.push((0..columns.len()).map(|i| decode_cell(&row, i)).collect());
+            }
+        }
+    }
+
+    // Postgres's command tag counts returned rows for SELECT too; only
+    // statements without a result set count as "affected rows"
+    if !columns.is_empty() {
+        rows_affected = 0;
+    }
 
     let row_count = result_rows.len();
-
     Ok(QueryResult {
         columns,
         rows: result_rows,
         row_count,
-        execution_time_ms,
+        rows_affected,
+        truncated,
+        execution_time_ms: 0, // filled in by execute_query
     })
 }

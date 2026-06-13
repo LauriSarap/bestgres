@@ -3,9 +3,20 @@ import { cn } from "@/lib/utils";
 
 interface EditableCellProps {
   value: unknown;
-  onSave: (newValue: string | number | boolean | null) => Promise<void>;
+  onSave: (newValue: string | null) => Promise<void>;
   disabled?: boolean;
   className?: string;
+}
+
+/**
+ * Values are sent to the backend as raw strings and cast server-side to the
+ * column's real type. Special inputs: empty or "null" → NULL, '' → empty string.
+ */
+export function parseEditValue(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (trimmed === "" || trimmed.toLowerCase() === "null") return null;
+  if (trimmed === "''") return "";
+  return raw;
 }
 
 export const EditableCell = React.memo(function EditableCell({
@@ -42,19 +53,9 @@ export const EditableCell = React.memo(function EditableCell({
     }
   }, [editing]);
 
-  const parseValue = (raw: string): string | number | boolean | null => {
-    const trimmed = raw.trim();
-    if (trimmed.toLowerCase() === "null" || trimmed === "") return null;
-    if (trimmed.toLowerCase() === "true") return true;
-    if (trimmed.toLowerCase() === "false") return false;
-    const num = Number(trimmed);
-    if (!Number.isNaN(num) && trimmed !== "") return num;
-    return trimmed;
-  };
-
   const save = useCallback(async () => {
     if (!editing) return;
-    const parsed = parseValue(editValue);
+    const parsed = parseEditValue(editValue);
     setSaving(true);
     setError(null);
     try {
@@ -135,6 +136,7 @@ export const EditableCell = React.memo(function EditableCell({
           className
         )}
         placeholder="NULL"
+        title="Enter to save, Esc to cancel. Empty or 'null' = NULL, '' = empty string"
       />
       {error && (
         <span className="text-[10px] text-destructive truncate" title={error}>

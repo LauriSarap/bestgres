@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Database,
@@ -15,11 +15,17 @@ import {
   Pencil,
   Trash2,
   HardDrive,
-  RefreshCw,
   FileCode,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useToast } from "@/components/Toast";
 import type { ConnectionEntry, SchemaObject } from "@/types";
+
+interface ConnContextMenu {
+  x: number;
+  y: number;
+  conn: ConnectionEntry;
+}
 
 interface SidebarProps {
   className?: string;
@@ -50,6 +56,7 @@ export function Sidebar({
   theme,
   onToggleTheme,
 }: SidebarProps) {
+  const { toast } = useToast();
   // Databases per connection
   const [databases, setDatabases] = useState<Record<string, string[]>>({});
   // Schema objects per "connectionId:database"
@@ -58,10 +65,32 @@ export function Sidebar({
   const [expandedDatabases, setExpandedDatabases] = useState<Set<string>>(new Set());
   const [loadingConn, setLoadingConn] = useState<string | null>(null);
   const [loadingDb, setLoadingDb] = useState<string | null>(null);
-  // Per-connection errors
+  // Last error per connection / database key, shown as a tooltip on the row
   const [connErrors, setConnErrors] = useState<Record<string, string>>({});
   // Connection health: true = alive, false = unreachable, undefined = unknown
   const [health, setHealth] = useState<Record<string, boolean>>({});
+  // Right-click menu on a connection row
+  const [ctxMenu, setCtxMenu] = useState<ConnContextMenu | null>(null);
+  const ctxMenuRef = useRef<HTMLDivElement>(null);
+
+  // Close the context menu on click outside or Escape
+  useEffect(() => {
+    if (!ctxMenu) return;
+    function handleClick(e: MouseEvent) {
+      if (ctxMenuRef.current && !ctxMenuRef.current.contains(e.target as Node)) {
+        setCtxMenu(null);
+      }
+    }
+    function handleKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setCtxMenu(null);
+    }
+    document.addEventListener("mousedown", handleClick);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handleClick);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [ctxMenu]);
 
   // Check health for all connections on mount and when connections change
   useEffect(() => {
@@ -91,7 +120,6 @@ export function Sidebar({
 
   const toggleConnection = useCallback(
     async (connId: string) => {
-      // If already expanded, collapse it (user can "close" even when there's an error)
       if (expandedConnections.has(connId)) {
         setExpandedConnections((prev) => {
           const next = new Set(prev);
@@ -102,30 +130,35 @@ export function Sidebar({
       }
 
       onSelectConnection(connId);
-      setExpandedConnections((prev) => new Set(prev).add(connId));
 
-      // Skip fetch if already loaded and no error
-      if (databases[connId] && !connErrors[connId]) return;
+      // Already loaded — expand instantly
+      if (databases[connId]) {
+        setExpandedConnections((prev) => new Set(prev).add(connId));
+        return;
+      }
 
+      // Unreachable connections stay collapsed: expand only once the
+      // database list actually loads
       setLoadingConn(connId);
-      setConnErrors((prev) => {
-        const next = { ...prev };
-        delete next[connId];
-        return next;
-      });
-
       try {
         const dbs = await invoke<string[]>("list_databases", { connectionId: connId });
         setDatabases((prev) => ({ ...prev, [connId]: dbs }));
         setHealth((prev) => ({ ...prev, [connId]: true }));
+        setConnErrors((prev) => {
+          const next = { ...prev };
+          delete next[connId];
+          return next;
+        });
+        setExpandedConnections((prev) => new Set(prev).add(connId));
       } catch (err) {
         setConnErrors((prev) => ({ ...prev, [connId]: String(err) }));
         setHealth((prev) => ({ ...prev, [connId]: false }));
+        toast("error", String(err));
       } finally {
         setLoadingConn(null);
       }
     },
-    [expandedConnections, databases, connErrors, onSelectConnection]
+    [expandedConnections, databases, onSelectConnection, toast]
   );
 
   const toggleDatabase = useCallback(
@@ -141,24 +174,32 @@ export function Sidebar({
         return;
       }
 
-      setExpandedDatabases((prev) => new Set(prev).add(key));
+      if (schemas[key]) {
+        setExpandedDatabases((prev) => new Set(prev).add(key));
+        return;
+      }
 
-      if (!schemas[key]) {
-        setLoadingDb(key);
-        try {
-          const objects = await invoke<SchemaObject[]>("get_schema", {
-            connectionId: connId,
-            database: dbName,
-          });
-          setSchemas((prev) => ({ ...prev, [key]: objects }));
-        } catch (err) {
-          setConnErrors((prev) => ({ ...prev, [key]: String(err) }));
-        } finally {
-          setLoadingDb(null);
-        }
+      setLoadingDb(key);
+      try {
+        const objects = await invoke<SchemaObject[]>("get_schema", {
+          connectionId: connId,
+          database: dbName,
+        });
+        setSchemas((prev) => ({ ...prev, [key]: objects }));
+        setConnErrors((prev) => {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
+        setExpandedDatabases((prev) => new Set(prev).add(key));
+      } catch (err) {
+        setConnErrors((prev) => ({ ...prev, [key]: String(err) }));
+        toast("error", String(err));
+      } finally {
+        setLoadingDb(null);
       }
     },
-    [expandedDatabases, schemas]
+    [expandedDatabases, schemas, toast]
   );
 
   // Auto-expand newly added connections
@@ -216,6 +257,11 @@ export function Sidebar({
                 <div className="group flex items-center">
                   <button
                     onClick={() => toggleConnection(conn.id)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setCtxMenu({ x: e.clientX, y: e.clientY, conn });
+                    }}
+                    title={connError ? connError : undefined}
                     className={cn(
                       "flex flex-1 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs transition-colors",
                       conn.id === activeConnectionId
@@ -265,24 +311,8 @@ export function Sidebar({
                   </button>
                 </div>
 
-                {/* Connection error */}
-                {isExpanded && connError && !isLoadingConn && (
-                  <div className="ml-5 mt-1 mb-1">
-                    <p className="px-2 py-1 text-[10px] text-destructive leading-tight break-words">
-                      {connError}
-                    </p>
-                    <button
-                      onClick={() => toggleConnection(conn.id)}
-                      className="flex items-center gap-1 px-2 py-0.5 text-[10px] text-muted-foreground hover:text-primary transition-colors"
-                    >
-                      <RefreshCw className="h-2.5 w-2.5" />
-                      Retry
-                    </button>
-                  </div>
-                )}
-
                 {/* Databases tree */}
-                {isExpanded && !isLoadingConn && !connError && (
+                {isExpanded && (
                   <div className="ml-3 border-l border-border pl-1.5 mt-0.5">
                     {dbs.map((dbName) => {
                       const dbKey = `${conn.id}:${dbName}`;
@@ -298,6 +328,7 @@ export function Sidebar({
                           {/* Database row */}
                           <button
                             onClick={() => toggleDatabase(conn.id, dbName)}
+                            title={dbError ? dbError : undefined}
                             className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs text-sidebar-foreground hover:bg-accent transition-colors"
                           >
                             {isDbLoading ? (
@@ -311,17 +342,8 @@ export function Sidebar({
                             <span className="truncate">{dbName}</span>
                           </button>
 
-                          {/* Database error */}
-                          {isDbExpanded && dbError && !isDbLoading && (
-                            <div className="ml-5 mt-0.5">
-                              <p className="px-2 py-0.5 text-[10px] text-destructive leading-tight break-words">
-                                {dbError}
-                              </p>
-                            </div>
-                          )}
-
                           {/* Schema objects inside this database */}
-                          {isDbExpanded && !isDbLoading && !dbError && (
+                          {isDbExpanded && (
                             <div className="ml-3 border-l border-border pl-1.5 mt-0.5">
                               {/* New Query */}
                               <button
@@ -401,6 +423,36 @@ export function Sidebar({
           })
         )}
       </div>
+
+      {/* Connection context menu */}
+      {ctxMenu && (
+        <div
+          ref={ctxMenuRef}
+          className="fixed z-50 min-w-44 rounded-md border border-border bg-popover py-1 shadow-lg"
+          style={{ left: ctxMenu.x, top: ctxMenu.y }}
+        >
+          <button
+            onClick={() => {
+              onEditConnection(ctxMenu.conn);
+              setCtxMenu(null);
+            }}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-popover-foreground hover:bg-accent"
+          >
+            <Pencil className="h-3 w-3" />
+            Edit connection
+          </button>
+          <button
+            onClick={() => {
+              onDeleteConnection(ctxMenu.conn);
+              setCtxMenu(null);
+            }}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-destructive hover:bg-destructive/10"
+          >
+            <Trash2 className="h-3 w-3" />
+            Remove connection
+          </button>
+        </div>
+      )}
 
       {/* Bottom — Theme Toggle */}
       <div className="flex items-center justify-end border-t border-sidebar-border px-4 py-2">

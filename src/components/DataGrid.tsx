@@ -17,6 +17,12 @@ interface CellContextMenu {
   rowJson: string;
 }
 
+function stringifyCell(value: unknown): string {
+  if (value === null || value === undefined) return "NULL";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
 interface DataGridProps<TData> {
   data: TData[];
   columns: ColumnDef<TData, unknown>[];
@@ -150,25 +156,25 @@ export const DataGrid = React.memo(function DataGrid<TData>({
                   >
                     {row.getVisibleCells().map((cell) => {
                       const rawValue = cell.getValue();
+                      const isDataCell = cell.column.id !== "select";
                       return (
                         <td
                           key={cell.id}
                           className="border-r border-border px-3 py-1 text-xs font-mono whitespace-nowrap max-w-80 truncate"
+                          title={
+                            isDataCell && rawValue !== null && rawValue !== undefined
+                              ? stringifyCell(rawValue)
+                              : undefined
+                          }
                           onContextMenu={(e) => {
                             // Skip context menu for selection checkbox column
-                            if (cell.column.id === "select") return;
+                            if (!isDataCell) return;
                             e.preventDefault();
-                            const cellStr =
-                              rawValue === null || rawValue === undefined
-                                ? "NULL"
-                                : typeof rawValue === "object"
-                                  ? JSON.stringify(rawValue)
-                                  : String(rawValue);
                             const rowObj = row.original as Record<string, unknown>;
                             setCellMenu({
                               x: e.clientX,
                               y: e.clientY,
-                              cellValue: cellStr,
+                              cellValue: stringifyCell(rawValue),
                               rowJson: JSON.stringify(rowObj, null, 2),
                             });
                           }}

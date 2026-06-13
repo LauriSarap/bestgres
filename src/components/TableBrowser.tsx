@@ -1,19 +1,10 @@
-import { useEffect, useState, useMemo, useCallback, useRef, type SetStateAction } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useState, useEffect, useMemo, useCallback, type SetStateAction } from "react";
 import { Loader2, AlertCircle, Clock, Rows3, ChevronDown, Plus, Trash2, ArrowUp, ArrowDown, ArrowUpDown, Filter, X } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { DataGrid } from "@/components/DataGrid";
-import { EditableCell } from "@/components/EditableCell";
+import { EditableCell, parseEditValue } from "@/components/EditableCell";
 import { useToast } from "@/components/Toast";
-import type { QueryResult, ColumnInfo } from "@/types";
-
-const PAGE_SIZE = 100;
-
-type SortDirection = "asc" | "desc" | null;
-interface SortState {
-  column: string;
-  direction: SortDirection;
-}
+import { useTableData } from "@/hooks/use-table-data";
 
 interface TableBrowserProps {
   connectionId: string;
@@ -24,215 +15,56 @@ interface TableBrowserProps {
 
 export function TableBrowser({ connectionId, database, schema, table }: TableBrowserProps) {
   const { toast } = useToast();
-  const [rows, setRows] = useState<unknown[][]>([]);
-  const [columnNames, setColumnNames] = useState<string[]>([]);
-  const [columnTypes, setColumnTypes] = useState<Map<string, string>>(new Map());
-  const [primaryKeyColumns, setPrimaryKeyColumns] = useState<string[]>([]);
-  const [totalCount, setTotalCount] = useState<number | null>(null);
-  const [execTime, setExecTime] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const {
+    data,
+    rowCount,
+    columnNames,
+    columnTypes,
+    primaryKeyColumns,
+    totalCount,
+    execTime,
+    loading,
+    loadingMore,
+    error,
+    clearError,
+    sort,
+    toggleSort,
+    columnFilters,
+    setFilter,
+    clearFilters,
+    hasMore,
+    loadMore,
+    getRowId,
+    updateCell,
+    insertRow,
+    deleteRowsByIds,
+  } = useTableData({ connectionId, database, schema, table });
+
   const [rowSelection, setRowSelection] = useState<Record<string, boolean>>({});
   const [showAddRow, setShowAddRow] = useState(false);
   const [draftValues, setDraftValues] = useState<Record<string, string>>({});
   const [inserting, setInserting] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [insertError, setInsertError] = useState<string | null>(null);
-  const [sort, setSort] = useState<SortState>({ column: "", direction: null });
-  const [columnFilters, setColumnFilters] = useState<Record<string, string>>({});
   const [showFilters, setShowFilters] = useState(false);
 
-  const buildWhereClause = useCallback((): string => {
-    const parts: string[] = [];
-    for (const [col, val] of Object.entries(columnFilters)) {
-      const trimmed = val.trim();
-      if (!trimmed) continue;
-      // Support: "NULL", "NOT NULL", or ILIKE pattern
-      if (trimmed.toLowerCase() === "null") {
-        parts.push(`"${col}" IS NULL`);
-      } else if (trimmed.toLowerCase() === "not null") {
-        parts.push(`"${col}" IS NOT NULL`);
-      } else {
-        // Use ILIKE for text search; cast to text for non-text columns
-        parts.push(`"${col}"::text ILIKE '%${trimmed.replace(/'/g, "''")}%'`);
-      }
-    }
-    return parts.length > 0 ? ` WHERE ${parts.join(" AND ")}` : "";
-  }, [columnFilters]);
+  const hasPk = primaryKeyColumns.length > 0;
 
-  const buildOrderClause = useCallback((): string => {
-    if (!sort.column || !sort.direction) return "";
-    return ` ORDER BY "${sort.column}" ${sort.direction.toUpperCase()}`;
-  }, [sort]);
-
-  const buildSelectSql = useCallback(
-    (limit: number, offset = 0): string => {
-      return `SELECT * FROM "${schema}"."${table}"${buildWhereClause()}${buildOrderClause()} LIMIT ${limit} OFFSET ${offset}`;
-    },
-    [schema, table, buildWhereClause, buildOrderClause]
-  );
-
-  const buildCountSql = useCallback((): string => {
-    return `SELECT COUNT(*) FROM "${schema}"."${table}"${buildWhereClause()}`;
-  }, [schema, table, buildWhereClause]);
-
-  // Load metadata (columns, PK) — only when the table changes
+  // Sort/filter changes refetch the page — drop any selection so rows that
+  // fall out of view can't be deleted invisibly
   useEffect(() => {
-    let cancelled = false;
-
-    async function loadMeta() {
-      setLoading(true);
-      setError(null);
-      setRows([]);
-      setColumnNames([]);
-      setColumnTypes(new Map());
-      setPrimaryKeyColumns([]);
-      setTotalCount(null);
-      setShowAddRow(false);
-      setRowSelection({});
-      setInsertError(null);
-      setSort({ column: "", direction: null });
-      setColumnFilters({});
-
-      try {
-        const [dataRes, countRes, colInfo, pkCols] = await Promise.all([
-          invoke<QueryResult>("execute_query", {
-            connectionId,
-            database,
-            sql: `SELECT * FROM "${schema}"."${table}" LIMIT ${PAGE_SIZE}`,
-          }),
-          invoke<QueryResult>("execute_query", {
-            connectionId,
-            database,
-            sql: `SELECT COUNT(*) FROM "${schema}"."${table}"`,
-          }),
-          invoke<ColumnInfo[]>("get_columns", {
-            connectionId,
-            database,
-            schema,
-            table,
-          }),
-          invoke<string[]>("get_primary_key_columns", {
-            connectionId,
-            database,
-            schema,
-            table,
-          }),
-        ]);
-
-        if (cancelled) return;
-
-        setColumnNames(dataRes.columns);
-        setRows(dataRes.rows);
-        setExecTime(dataRes.execution_time_ms);
-
-        const cnt = countRes.rows[0]?.[0];
-        if (cnt !== null && cnt !== undefined) {
-          setTotalCount(Number(cnt));
-        }
-
-        const typeMap = new Map<string, string>();
-        for (const col of colInfo) {
-          typeMap.set(col.name, col.data_type);
-        }
-        setColumnTypes(typeMap);
-        setPrimaryKeyColumns(pkCols);
-      } catch (err) {
-        if (!cancelled) setError(String(err));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-
-    loadMeta();
-    return () => { cancelled = true; };
-  }, [connectionId, database, schema, table]);
-
-  // Refetch data when sort/filter changes (not on initial load)
-  const [dataGeneration, setDataGeneration] = useState(0);
-  useEffect(() => {
-    // Skip the first render — the metadata effect handles the initial load
-    if (loading) return;
-    let cancelled = false;
-
-    async function refetchData() {
-      setError(null);
-      setRowSelection({});
-
-      try {
-        const [dataRes, countRes] = await Promise.all([
-          invoke<QueryResult>("execute_query", {
-            connectionId,
-            database,
-            sql: buildSelectSql(PAGE_SIZE),
-          }),
-          invoke<QueryResult>("execute_query", {
-            connectionId,
-            database,
-            sql: buildCountSql(),
-          }),
-        ]);
-
-        if (cancelled) return;
-
-        setRows(dataRes.rows);
-        setExecTime(dataRes.execution_time_ms);
-
-        const cnt = countRes.rows[0]?.[0];
-        if (cnt !== null && cnt !== undefined) {
-          setTotalCount(Number(cnt));
-        }
-      } catch (err) {
-        if (!cancelled) setError(String(err));
-      }
-    }
-
-    refetchData();
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataGeneration]);
-
-  // Load more pages
-  const loadMore = useCallback(async () => {
-    if (loadingMore) return;
-    setLoadingMore(true);
-    try {
-      const offset = rows.length;
-      const res = await invoke<QueryResult>("execute_query", {
-        connectionId,
-        database,
-        sql: buildSelectSql(PAGE_SIZE, offset),
-      });
-      setRows((prev) => [...prev, ...res.rows]);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoadingMore(false);
-    }
-  }, [connectionId, database, schema, table, rows.length, loadingMore, buildSelectSql]);
-
-  const parseCellValue = useCallback((raw: string): string | number | boolean | null => {
-    const trimmed = raw.trim();
-    if (trimmed.toLowerCase() === "null" || trimmed === "") return null;
-    if (trimmed.toLowerCase() === "true") return true;
-    if (trimmed.toLowerCase() === "false") return false;
-    const num = Number(trimmed);
-    if (!Number.isNaN(num) && trimmed !== "") return num;
-    return trimmed;
-  }, []);
+    setRowSelection({});
+  }, [sort, columnFilters]);
 
   const handleInsert = useCallback(async () => {
     const columns: string[] = [];
-    const values: (string | number | boolean | null)[] = [];
-    const types: string[] = [];
+    const values: (string | null)[] = [];
     for (const col of columnNames) {
-      const raw = (draftValues[col] ?? "").trim();
-      if (raw === "") continue;
-      const parsed = parseCellValue(raw);
+      const raw = draftValues[col] ?? "";
+      // Blank fields are omitted entirely so column defaults apply
+      if (raw.trim() === "") continue;
       columns.push(col);
-      values.push(parsed);
-      types.push(columnTypes.get(col) ?? "text");
+      values.push(parseEditValue(raw));
     }
     if (columns.length === 0) {
       setInsertError("Fill in at least one column");
@@ -241,26 +73,9 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     setInsertError(null);
     setInserting(true);
     try {
-      await invoke("insert_row", {
-        connectionId,
-        database,
-        schema,
-        table,
-        columns,
-        values,
-        columnTypes: types,
-      });
+      await insertRow(columns, values);
       setShowAddRow(false);
       setDraftValues({});
-      setInsertError(null);
-      setTotalCount((c) => (c !== null ? c + 1 : null));
-      // Refetch first page to include the new row
-      const res = await invoke<QueryResult>("execute_query", {
-        connectionId,
-        database,
-        sql: buildSelectSql(PAGE_SIZE),
-      });
-      setRows(res.rows);
       toast("success", "Row inserted");
     } catch (err) {
       setInsertError(String(err));
@@ -268,86 +83,31 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     } finally {
       setInserting(false);
     }
-  }, [
-    connectionId,
-    database,
-    schema,
-    table,
-    columnNames,
-    columnTypes,
-    draftValues,
-    parseCellValue,
-    buildSelectSql,
-    toast,
-  ]);
+  }, [columnNames, draftValues, insertRow, toast]);
 
   const handleDelete = useCallback(async () => {
     const selectedIds = Object.entries(rowSelection)
       .filter(([, v]) => v)
       .map(([id]) => id);
     if (selectedIds.length === 0) return;
-    const pkValuesList = selectedIds.map((id) => {
-      const parts = id.split("\x01");
-      return parts.map((p) => {
-        try {
-          return JSON.parse(p) as unknown;
-        } catch {
-          return p;
-        }
-      });
-    });
     setDeleting(true);
-    setError(null);
     try {
-      await invoke("delete_rows", {
-        connectionId,
-        database,
-        schema,
-        table,
-        primaryKeyColumns,
-        primaryKeyValuesList: pkValuesList,
-      });
+      await deleteRowsByIds(selectedIds);
       setRowSelection({});
-      const indicesToRemove = new Set(
-        selectedIds.map((id) =>
-          rows.findIndex((row) => {
-            const pkVals = primaryKeyColumns.map((pk) => {
-              const colIdx = columnNames.indexOf(pk);
-              return colIdx >= 0 ? row[colIdx] : undefined;
-            });
-            return pkVals.map((v) => JSON.stringify(v ?? null)).join("\x01") === id;
-          })
-        )
-      );
-      setRows((prev) => prev.filter((_, i) => !indicesToRemove.has(i)));
-      setTotalCount((c) => (c !== null ? Math.max(0, c - selectedIds.length) : null));
       toast("success", `Deleted ${selectedIds.length} row${selectedIds.length > 1 ? "s" : ""}`);
-    } catch (err) {
-      setError(String(err));
+    } catch {
       toast("error", "Delete failed");
     } finally {
       setDeleting(false);
     }
-  }, [
-    connectionId,
-    database,
-    schema,
-    table,
-    rowSelection,
-    primaryKeyColumns,
-    columnNames,
-    rows,
-    toast,
-  ]);
+  }, [rowSelection, deleteRowsByIds, toast]);
 
-  const getRowId = useCallback(
-    (row: Record<string, unknown>) => {
-      if (primaryKeyColumns.length === 0) return "";
-      return primaryKeyColumns
-        .map((pk) => JSON.stringify(row[pk] ?? null))
-        .join("\x01");
+  const handleCellSave = useCallback(
+    async (rowIndex: number, columnName: string, newValue: string | null) => {
+      await updateCell(rowIndex, columnName, newValue);
+      toast("success", `Updated ${columnName}`);
     },
-    [primaryKeyColumns]
+    [updateCell, toast]
   );
 
   const handleRowSelectionChange = useCallback(
@@ -359,78 +119,6 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     },
     []
   );
-
-  const rowsRef = useRef(rows);
-  rowsRef.current = rows;
-
-  const handleCellSave = useCallback(
-    async (
-      rowIndex: number,
-      columnName: string,
-      newValue: string | number | boolean | null
-    ) => {
-      const rowArr = rowsRef.current[rowIndex];
-      if (!rowArr) return;
-      const pkValues = primaryKeyColumns.map((pk) => {
-        const colIndex = columnNames.indexOf(pk);
-        return colIndex >= 0 ? rowArr[colIndex] ?? null : null;
-      });
-      await invoke("update_cell", {
-        connectionId,
-        database,
-        schema,
-        table,
-        column: columnName,
-        primaryKeyColumns,
-        primaryKeyValues: pkValues,
-        newValue,
-      });
-      const colIndex = columnNames.indexOf(columnName);
-      if (colIndex === -1) return;
-      setRows((prev) => {
-        const next = [...prev];
-        const rowCopy = [...next[rowIndex]];
-        rowCopy[colIndex] = newValue;
-        next[rowIndex] = rowCopy;
-        return next;
-      });
-      toast("success", `Updated ${columnName}`);
-    },
-    [connectionId, database, schema, table, primaryKeyColumns, columnNames, toast]
-  );
-
-  const toggleSort = useCallback(
-    (col: string) => {
-      setSort((prev) => {
-        if (prev.column !== col) return { column: col, direction: "asc" };
-        if (prev.direction === "asc") return { column: col, direction: "desc" };
-        return { column: "", direction: null };
-      });
-      setDataGeneration((g) => g + 1);
-    },
-    []
-  );
-
-  const filterDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const handleFilterChange = useCallback(
-    (col: string, value: string) => {
-      setColumnFilters((prev) => ({ ...prev, [col]: value }));
-      if (filterDebounceRef.current) clearTimeout(filterDebounceRef.current);
-      filterDebounceRef.current = setTimeout(() => {
-        setDataGeneration((g) => g + 1);
-      }, 400);
-    },
-    []
-  );
-
-  const clearFilters = useCallback(() => {
-    setColumnFilters({});
-    if (filterDebounceRef.current) clearTimeout(filterDebounceRef.current);
-    setDataGeneration((g) => g + 1);
-  }, []);
-
-  const hasPk = primaryKeyColumns.length > 0;
 
   const selectionColumn: ColumnDef<Record<string, unknown>, unknown> | null = useMemo(
     () =>
@@ -506,9 +194,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
             return (
               <EditableCell
                 value={v}
-                onSave={(newVal) =>
-                  handleCellSave(rowIndex, col, newVal)
-                }
+                onSave={(newVal) => handleCellSave(rowIndex, col, newVal)}
                 disabled={false}
               />
             );
@@ -524,27 +210,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
       };
     });
     return selectionColumn ? [selectionColumn, ...dataCols] : dataCols;
-  }, [
-    columnNames,
-    columnTypes,
-    primaryKeyColumns,
-    handleCellSave,
-    selectionColumn,
-    sort,
-    toggleSort,
-  ]);
-
-  const data: Record<string, unknown>[] = useMemo(() => {
-    return rows.map((row) => {
-      const obj: Record<string, unknown> = {};
-      columnNames.forEach((col, i) => {
-        obj[col] = row[i];
-      });
-      return obj;
-    });
-  }, [rows, columnNames]);
-
-  const hasMore = totalCount !== null && rows.length < totalCount;
+  }, [columnNames, columnTypes, primaryKeyColumns, handleCellSave, selectionColumn, sort, toggleSort]);
 
   if (loading) {
     return (
@@ -555,11 +221,13 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
     );
   }
 
-  if (error) {
+  // Full-screen error only when we never got the table loaded;
+  // later errors (bad filter, lost connection) show as a banner instead
+  if (error && columnNames.length === 0) {
     return (
-      <div className="flex h-full items-center justify-center gap-2 text-sm text-destructive">
-        <AlertCircle className="h-4 w-4" />
-        {error}
+      <div className="flex h-full items-center justify-center gap-2 px-6 text-sm text-destructive">
+        <AlertCircle className="h-4 w-4 shrink-0" />
+        <span className="break-all">{error}</span>
       </div>
     );
   }
@@ -574,7 +242,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
         <div className="flex items-center gap-4">
           <span className="flex items-center gap-1">
             <Rows3 className="h-3 w-3" />
-            {rows.length}{totalCount !== null ? ` / ${totalCount}` : ""} rows
+            {rowCount}{totalCount !== null ? ` / ${totalCount}` : ""} rows
           </span>
           <span className="flex items-center gap-1">
             <Clock className="h-3 w-3" />
@@ -642,7 +310,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
                 <input
                   type="text"
                   value={columnFilters[col] ?? ""}
-                  onChange={(e) => handleFilterChange(col, e.target.value)}
+                  onChange={(e) => setFilter(col, e.target.value)}
                   placeholder="filter..."
                   className="w-24 rounded border border-border bg-background px-1.5 py-0.5 text-[11px] font-mono placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-primary"
                 />
@@ -652,6 +320,22 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
           <p className="mt-1 text-[10px] text-muted-foreground/60">
             Type to filter (ILIKE). Use &quot;null&quot; or &quot;not null&quot; for NULL checks.
           </p>
+        </div>
+      )}
+
+      {error && (
+        <div className="flex items-start justify-between gap-2 border-b border-border bg-destructive/10 px-4 py-1.5">
+          <div className="flex items-start gap-2 text-xs text-destructive">
+            <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+            <span className="break-all">{error}</span>
+          </div>
+          <button
+            onClick={clearError}
+            className="rounded p-0.5 text-destructive/70 hover:text-destructive transition-colors"
+            title="Dismiss"
+          >
+            <X className="h-3 w-3" />
+          </button>
         </div>
       )}
 
@@ -722,7 +406,7 @@ export function TableBrowser({ connectionId, database, schema, table }: TableBro
             ) : (
               <ChevronDown className="h-3 w-3" />
             )}
-            Load more ({totalCount! - rows.length} remaining)
+            Load more ({totalCount! - rowCount} remaining)
           </button>
         </div>
       )}

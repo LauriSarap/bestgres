@@ -72,16 +72,19 @@ pub async fn get_table_structure(
     postgres::get_table_structure(&pool, &schema, &table).await
 }
 
-/// Execute a SQL query against a specific database on a connection.
+/// Execute SQL against a specific database on a connection.
+/// `params` (optional) are bound to $1, $2, ... as text — when present the
+/// SQL must be a single statement.
 #[tauri::command]
 pub async fn execute_query(
     state: State<'_, AppState>,
     connection_id: String,
     database: String,
     sql: String,
+    params: Option<Vec<JsonValue>>,
 ) -> Result<QueryResult, AppError> {
     let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
-    postgres::execute_query(&pool, &sql).await
+    postgres::execute_query(&pool, &sql, &params.unwrap_or_default()).await
 }
 
 /// Update a single cell value in a table. Requires a primary key to identify the row.
@@ -120,10 +123,9 @@ pub async fn insert_row(
     table: String,
     columns: Vec<String>,
     values: Vec<JsonValue>,
-    column_types: Vec<String>,
 ) -> Result<u64, AppError> {
     let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
-    postgres::insert_row(&pool, &schema, &table, &columns, &values, &column_types).await
+    postgres::insert_row(&pool, &schema, &table, &columns, &values).await
 }
 
 /// Delete rows by primary key. Each inner vec is one row's PK values.

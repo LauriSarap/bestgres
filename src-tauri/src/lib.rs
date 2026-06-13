@@ -1,6 +1,6 @@
 mod commands;
-mod db;
-mod models;
+pub mod db;
+pub mod models;
 
 use commands::connection::AppState;
 use tauri::Manager;

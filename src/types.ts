@@ -10,6 +10,10 @@ export interface QueryResult {
   columns: string[];
   rows: (string | number | boolean | null)[][];
   row_count: number;
+  /** Rows affected by INSERT/UPDATE/DELETE statements (summed across a script) */
+  rows_affected: number;
+  /** True if the result set was cut off at the server-side row cap */
+  truncated: boolean;
   execution_time_ms: number;
 }
 

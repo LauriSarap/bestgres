@@ -14,14 +14,18 @@ pub struct ConnectionConfig {
 }
 
 /// Config format for JSON files in ~/.config/bestgres/connections/.
-/// Includes password directly (unlike ConnectionConfig which uses keychain).
+/// Passwords live in the system keychain, keyed by the stable `id`.
+/// `password` is only read for migrating legacy files that stored it inline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionFileConfig {
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub host: String,
     pub port: u16,
     pub user: String,
-    pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
     pub database: String,
     #[serde(default)]
     pub ssl: bool,
@@ -97,12 +101,16 @@ pub struct TableStructure {
     pub foreign_keys: Vec<ForeignKeyInfo>,
 }
 
-/// Result of executing a query — column names + rows of string values.
+/// Result of executing a query — column names + rows of JSON values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub row_count: usize,
+    /// Rows affected by INSERT/UPDATE/DELETE statements (summed across a script).
+    pub rows_affected: u64,
+    /// True if the result set was cut off at MAX_QUERY_ROWS.
+    pub truncated: bool,
     pub execution_time_ms: u64,
 }
 

@@ -21,34 +21,38 @@ fn connections_dir() -> Result<std::path::PathBuf, AppError> {
     Ok(dir)
 }
 
-/// Persist a connection as a JSON file in the config directory.
-/// Filename is derived from the connection name (sanitized).
-fn save_connection_to_file(config: &ConnectionConfig, password: &str) -> Result<(), AppError> {
-    let dir = connections_dir()?;
-    // Sanitize name for filename: lowercase, replace non-alphanumeric with underscore
+/// Filename for a connection's config file, derived from its name (sanitized).
+fn connection_filename(config: &ConnectionConfig) -> String {
     let safe_name: String = config
         .name
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect::<String>()
         .to_lowercase();
-    let filename = if safe_name.is_empty() {
+    if safe_name.is_empty() {
         format!("{}.json", &config.id[..8])
     } else {
         format!("{}.json", safe_name)
-    };
+    }
+}
+
+/// Persist a connection as a JSON file in the config directory.
+/// The password is NOT written to disk — it lives in the system keychain.
+fn save_connection_to_file(config: &ConnectionConfig) -> Result<(), AppError> {
+    let dir = connections_dir()?;
     let file_config = ConnectionFileConfig {
+        id: Some(config.id.clone()),
         name: config.name.clone(),
         host: config.host.clone(),
         port: config.port,
         user: config.user.clone(),
-        password: password.to_string(),
+        password: None,
         database: config.database.clone(),
         ssl: config.ssl,
     };
     let json = serde_json::to_string_pretty(&file_config)
         .map_err(|e| AppError::Config(format!("Cannot serialize config: {}", e)))?;
-    std::fs::write(dir.join(&filename), json)
+    std::fs::write(dir.join(connection_filename(config)), json)
         .map_err(|e| AppError::Config(format!("Cannot write config file: {}", e)))?;
     Ok(())
 }
@@ -56,18 +60,7 @@ fn save_connection_to_file(config: &ConnectionConfig, password: &str) -> Result<
 /// Delete the config file for a connection by trying to match by name.
 fn delete_connection_file(config: &ConnectionConfig) -> Result<(), AppError> {
     let dir = connections_dir()?;
-    let safe_name: String = config
-        .name
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect::<String>()
-        .to_lowercase();
-    let filename = if safe_name.is_empty() {
-        format!("{}.json", &config.id[..8])
-    } else {
-        format!("{}.json", safe_name)
-    };
-    let path = dir.join(&filename);
+    let path = dir.join(connection_filename(config));
     if path.exists() {
         std::fs::remove_file(&path)
             .map_err(|e| AppError::Config(format!("Cannot delete config file: {}", e)))?;
@@ -187,8 +180,8 @@ pub async fn add_connection(
 ) -> Result<(), AppError> {
     store_password(&config.id, &password)?;
 
-    // Persist to config file
-    let _ = save_connection_to_file(&config, &password);
+    // Persist to config file (password stays in the keychain only)
+    let _ = save_connection_to_file(&config);
 
     // Try to connect — save the connection regardless of outcome
     let conn_str = build_connection_string(
@@ -240,7 +233,7 @@ pub async fn update_connection(
     }
 
     // Persist updated config
-    let _ = save_connection_to_file(&config, &effective_password);
+    let _ = save_connection_to_file(&config);
 
     // Close old pools for this connection
     {
@@ -382,10 +375,14 @@ pub async fn check_connection(
     };
     drop(pools);
 
-    match postgres::test_connection(&pool).await {
-        Ok(()) => Ok(true),
-        Err(_) => Ok(false),
-    }
+    // Short timeout so dead hosts show a red dot quickly instead of
+    // waiting out the pool's full 5s acquire timeout
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        postgres::test_connection(&pool),
+    )
+    .await;
+    Ok(matches!(probe, Ok(Ok(()))))
 }
 
 /// List all saved connections.
@@ -399,6 +396,12 @@ pub async fn list_connections(
 
 /// Load connections from JSON files in ~/.config/bestgres/connections/.
 /// Returns the list of successfully loaded ConnectionConfigs.
+///
+/// Idempotent: rebuilds the in-memory connection list from scratch, so calling
+/// it twice (e.g. React StrictMode in dev) does not duplicate connections.
+/// Connection ids are stable — persisted in the file — so keychain entries are
+/// reused across launches. Legacy files with an inline password are migrated:
+/// the password moves to the keychain and the file is rewritten without it.
 #[tauri::command]
 pub async fn load_config_connections(
     state: State<'_, AppState>,
@@ -409,6 +412,7 @@ pub async fn load_config_connections(
         .map_err(|e| AppError::Config(format!("Cannot read config dir: {}", e)))?;
 
     let mut loaded: Vec<ConnectionConfig> = Vec::new();
+    let mut new_pools: Vec<(String, PgPool)> = Vec::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -426,12 +430,10 @@ pub async fn load_config_connections(
             Err(_) => continue,
         };
 
-        let id = uuid::Uuid::new_v4().to_string();
-
-        // Store password in keychain (must succeed to be useful)
-        if store_password(&id, &file_config.password).is_err() {
-            continue;
-        }
+        let id = file_config
+            .id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let config = ConnectionConfig {
             id: id.clone(),
@@ -443,27 +445,57 @@ pub async fn load_config_connections(
             ssl: file_config.ssl,
         };
 
+        // Resolve the password: keychain first, falling back to a legacy
+        // inline password (which we then migrate into the keychain).
+        let password = match get_password(&id) {
+            Ok(p) => p,
+            Err(_) => match &file_config.password {
+                Some(p) => {
+                    if store_password(&id, p).is_err() {
+                        continue;
+                    }
+                    p.clone()
+                }
+                None => continue, // no usable credentials
+            },
+        };
+
+        // Rewrite the file if it's missing the stable id or still has the password inline
+        if file_config.id.is_none() || file_config.password.is_some() {
+            let _ = save_connection_to_file(&config);
+        }
+
         // Create a lazy pool — doesn't actually connect until first query.
         // This ensures the connection always appears in the sidebar instantly.
         let conn_str = build_connection_string(
             &config.host,
             config.port,
             &config.user,
-            &file_config.password,
+            &password,
             &config.database,
             config.ssl,
         );
         if let Ok(pool) = postgres::create_pool_lazy(&conn_str) {
-            let mut pools = state.pools.lock().await;
-            pools.insert(id, pool);
-            drop(pools);
+            new_pools.push((id, pool));
         }
 
-        let mut connections = state.connections.lock().await;
-        connections.push(config.clone());
-        drop(connections);
-
         loaded.push(config);
+    }
+
+    // Swap the rebuilt state in atomically so concurrent calls
+    // (e.g. React StrictMode double-mount) can't interleave into duplicates
+    {
+        let mut pools = state.pools.lock().await;
+        let old: Vec<PgPool> = pools.drain().map(|(_, p)| p).collect();
+        pools.extend(new_pools);
+        let mut connections = state.connections.lock().await;
+        connections.clear();
+        connections.extend(loaded.iter().cloned());
+        drop(connections);
+        drop(pools);
+        for pool in old {
+            pool.close().await;
+        }
     }
 
     Ok(loaded)

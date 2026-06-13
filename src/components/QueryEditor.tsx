@@ -51,7 +51,11 @@ export function QueryEditor({ connectionId, database }: QueryEditorProps) {
         sql: trimmed,
       });
       setResult(res);
-      toast("success", `${res.row_count} row${res.row_count !== 1 ? "s" : ""} in ${res.execution_time_ms}ms`);
+      const summary =
+        res.columns.length === 0
+          ? `${res.rows_affected} row${res.rows_affected !== 1 ? "s" : ""} affected`
+          : `${res.row_count} row${res.row_count !== 1 ? "s" : ""}`;
+      toast("success", `${summary} in ${res.execution_time_ms}ms`);
       // Add to history (fire-and-forget)
       invoke("add_to_history", { sql: trimmed, database }).catch(() => {});
     } catch (err) {
@@ -184,7 +188,9 @@ export function QueryEditor({ connectionId, database }: QueryEditorProps) {
               <>
                 <span className="flex items-center gap-1">
                   <Rows3 className="h-3 w-3" />
-                  {result.row_count} rows
+                  {result.columns.length === 0
+                    ? `${result.rows_affected} affected`
+                    : `${result.row_count} rows`}
                 </span>
                 <span className="flex items-center gap-1">
                   <Clock className="h-3 w-3" />
@@ -378,7 +384,15 @@ export function QueryEditor({ connectionId, database }: QueryEditorProps) {
             </div>
           )}
           {result && !error && (
-            <DataGrid data={data} columns={columns} className="h-full" />
+            <div className="flex h-full flex-col">
+              {result.truncated && (
+                <div className="flex items-center gap-2 border-b border-border bg-yellow-500/10 px-4 py-1.5 text-xs text-yellow-600 dark:text-yellow-400">
+                  <AlertCircle className="h-3 w-3 shrink-0" />
+                  Results truncated to the first {result.row_count} rows. Add a LIMIT to refine.
+                </div>
+              )}
+              <DataGrid data={data} columns={columns} className="flex-1" />
+            </div>
           )}
           {!result && !error && (
             <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
