@@ -7,6 +7,7 @@ import {
   type ConnectionFormData,
 } from "@/components/ConnectionDialog";
 import { ToastProvider, useToast } from "@/components/Toast";
+import { SettingsDialog } from "@/components/SettingsDialog";
 import { useTheme } from "@/hooks/use-theme";
 import type { Tab, ConnectionEntry } from "@/types";
 
@@ -24,11 +25,19 @@ function AppInner() {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [editingConnection, setEditingConnection] = useState<ConnectionEntry | null>(null);
   const [connections, setConnections] = useState<ConnectionEntry[]>([]);
   const [activeConnectionId, setActiveConnectionId] = useState<string | null>(null);
+  const [dirtyTabs, setDirtyTabs] = useState<Set<string>>(new Set());
+  const restoredRef = useRef(false);
 
-  /* ── Load config connections on mount ── */
+  const getConnection = useCallback(
+    (id: string) => connections.find((c) => c.id === id),
+    [connections]
+  );
+
+  /* ── Load config connections on mount, then restore saved tabs ── */
 
   useEffect(() => {
     async function loadFromConfig() {
@@ -38,11 +47,79 @@ function AppInner() {
           setConnections(loaded);
           setActiveConnectionId(loaded[0].id);
         }
+        // Restore tabs whose connection still exists (ids are stable across launches)
+        if (!restoredRef.current) {
+          restoredRef.current = true;
+          try {
+            const savedTabs: Tab[] = JSON.parse(localStorage.getItem("bestgres:tabs") ?? "[]");
+            const validIds = new Set(loaded.map((c) => c.id));
+            const restored = savedTabs.filter((t) => validIds.has(t.connectionId));
+            if (restored.length > 0) {
+              setTabs(restored);
+              const savedActive = localStorage.getItem("bestgres:activeTab");
+              setActiveTabId(
+                savedActive && restored.some((t) => t.id === savedActive)
+                  ? savedActive
+                  : restored[0].id
+              );
+            }
+          } catch {
+            // ignore malformed saved state
+          }
+        }
       } catch {
         // Config dir may not exist or have no files — that's fine
       }
     }
     loadFromConfig();
+  }, []);
+
+  /* ── Quiet update check on startup ── */
+
+  useEffect(() => {
+    let cancelled = false;
+    import("@tauri-apps/plugin-updater")
+      .then(({ check }) => check())
+      .then((update) => {
+        if (!cancelled && update) {
+          toast("info", `Update ${update.version} available — open Settings to install`);
+        }
+      })
+      .catch(() => {
+        // No update endpoint reachable (e.g. dev, draft release) — ignore
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [toast]);
+
+  /* ── Persist tabs + active tab for session restore ── */
+
+  useEffect(() => {
+    if (!restoredRef.current) return;
+    localStorage.setItem("bestgres:tabs", JSON.stringify(tabs));
+    if (activeTabId) localStorage.setItem("bestgres:activeTab", activeTabId);
+    else localStorage.removeItem("bestgres:activeTab");
+  }, [tabs, activeTabId]);
+
+  /* ── Tab reorder / rename / dirty tracking ── */
+
+  const handleReorderTabs = useCallback((next: Tab[]) => setTabs(next), []);
+
+  const handleRenameTab = useCallback((id: string, title: string) => {
+    setTabs((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, customTitle: title || undefined } : t))
+    );
+  }, []);
+
+  const handleTabDirtyChange = useCallback((id: string, dirty: boolean) => {
+    setDirtyTabs((prev) => {
+      if (prev.has(id) === dirty) return prev;
+      const next = new Set(prev);
+      if (dirty) next.add(id);
+      else next.delete(id);
+      return next;
+    });
   }, []);
 
   /* ── Tab management ── */
@@ -108,30 +185,21 @@ function AppInner() {
 
   const handleAddConnection = useCallback(async (data: ConnectionFormData) => {
     const id = crypto.randomUUID();
-    await invoke("add_connection", {
-      config: {
-        id,
-        name: data.name,
-        host: data.host,
-        port: data.port,
-        user: data.user,
-        database: data.database,
-        ssl: data.ssl,
-      },
-      password: data.password,
-    });
-    setConnections((prev) => [
-      ...prev,
-      {
-        id,
-        name: data.name,
-        host: data.host,
-        port: data.port,
-        user: data.user,
-        database: data.database,
-        ssl: data.ssl,
-      },
-    ]);
+    const entry: ConnectionEntry = {
+      id,
+      name: data.name,
+      host: data.host,
+      port: data.port,
+      user: data.user,
+      database: data.database,
+      ssl: data.sslMode !== "disable",
+      ssl_mode: data.sslMode,
+      ssl_root_cert: data.sslRootCert || null,
+      color: data.color,
+      read_only: data.readOnly,
+    };
+    await invoke("add_connection", { config: entry, password: data.password });
+    setConnections((prev) => [...prev, entry]);
     setActiveConnectionId(id);
     toast("success", `Connected to ${data.name}`);
   }, [toast]);
@@ -139,33 +207,21 @@ function AppInner() {
   const handleEditConnection = useCallback(async (data: ConnectionFormData) => {
     if (!editingConnection) return;
     const id = editingConnection.id;
-    await invoke("update_connection", {
-      config: {
-        id,
-        name: data.name,
-        host: data.host,
-        port: data.port,
-        user: data.user,
-        database: data.database,
-        ssl: data.ssl,
-      },
-      password: data.password,
-    });
-    setConnections((prev) =>
-      prev.map((c) =>
-        c.id === id
-          ? {
-              ...c,
-              name: data.name,
-              host: data.host,
-              port: data.port,
-              user: data.user,
-              database: data.database,
-              ssl: data.ssl,
-            }
-          : c
-      )
-    );
+    const entry: ConnectionEntry = {
+      id,
+      name: data.name,
+      host: data.host,
+      port: data.port,
+      user: data.user,
+      database: data.database,
+      ssl: data.sslMode !== "disable",
+      ssl_mode: data.sslMode,
+      ssl_root_cert: data.sslRootCert || null,
+      color: data.color,
+      read_only: data.readOnly,
+    };
+    await invoke("update_connection", { config: entry, password: data.password });
+    setConnections((prev) => prev.map((c) => (c.id === id ? entry : c)));
     toast("success", `Updated ${data.name}`);
   }, [editingConnection, toast]);
 
@@ -262,6 +318,33 @@ function AppInner() {
     [connections, openTab]
   );
 
+  // FK navigation: open the referenced table pre-filtered. Always a fresh tab
+  // (bypasses dedup) so the filter context isn't lost.
+  const handleOpenRelated = useCallback(
+    (
+      connectionId: string,
+      database: string,
+      schema: string,
+      table: string,
+      filters: Record<string, string>
+    ) => {
+      const id = crypto.randomUUID();
+      const newTab: Tab = {
+        id,
+        title: table,
+        type: "table-browser",
+        connectionId,
+        database,
+        schema,
+        table,
+        initialFilters: filters,
+      };
+      setTabs((prev) => [...prev, newTab]);
+      setActiveTabId(id);
+    },
+    []
+  );
+
   /* ── Keyboard shortcuts ── */
 
   const tabsRef = useRef(tabs);
@@ -341,17 +424,24 @@ function AppInner() {
         onOpenQuery={handleOpenQuery}
         theme={theme}
         onToggleTheme={toggleTheme}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
 
       <main className="flex-1 overflow-hidden">
         <TabManager
           tabs={tabs}
           activeTabId={activeTabId}
+          dirtyTabs={dirtyTabs}
+          getConnection={getConnection}
           onSelectTab={handleSelectTab}
           onCloseTab={handleCloseTab}
           onCloseAllTabs={handleCloseAllTabs}
           onCloseOtherTabs={handleCloseOtherTabs}
           onCloseTabsToRight={handleCloseTabsToRight}
+          onReorder={handleReorderTabs}
+          onRenameTab={handleRenameTab}
+          onTabDirtyChange={handleTabDirtyChange}
+          onOpenRelated={handleOpenRelated}
         />
       </main>
 
@@ -361,6 +451,8 @@ function AppInner() {
         onSubmit={editingConnection ? handleEditConnection : handleAddConnection}
         editing={editingConnection}
       />
+
+      <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }

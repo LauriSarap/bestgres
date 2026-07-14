@@ -65,6 +65,28 @@ export interface TableStructure {
   foreign_keys: ForeignKeyInfo[];
 }
 
+/** A staged cell edit sent to the backend (matches Rust CellEdit) */
+export interface CellEdit {
+  column: string;
+  primary_key_columns: string[];
+  primary_key_values: unknown[];
+  new_value: string | null;
+}
+
+/** Progressive event from execute_query_stream (matches Rust StreamEvent) */
+export type StreamEvent =
+  | { type: "columns"; columns: string[] }
+  | { type: "rows"; rows: (string | number | boolean | null)[][] };
+
+/** Summary returned by execute_query_stream (matches Rust StreamSummary) */
+export interface StreamSummary {
+  columns: string[];
+  row_count: number;
+  rows_affected: number;
+  truncated: boolean;
+  execution_time_ms: number;
+}
+
 /** A tab in the main area */
 export interface Tab {
   id: string;
@@ -76,6 +98,10 @@ export interface Tab {
   /** For table-browser and table-structure tabs */
   schema?: string;
   table?: string;
+  /** Custom title set by the user (query tabs); falls back to `title` */
+  customTitle?: string;
+  /** Initial column filters (e.g. when opened via FK navigation) */
+  initialFilters?: Record<string, string>;
 }
 
 /** Query history entry */
@@ -102,4 +128,12 @@ export interface ConnectionEntry {
   user: string;
   database: string;
   ssl: boolean;
+  /** Postgres sslmode: "disable" | "require" | "verify-full" */
+  ssl_mode?: string | null;
+  /** Path to a CA cert for verify-full */
+  ssl_root_cert?: string | null;
+  /** UI accent color (hex) to distinguish connections, e.g. red for prod */
+  color?: string | null;
+  /** When true, sessions are read-only and editing UI is hidden */
+  read_only?: boolean;
 }

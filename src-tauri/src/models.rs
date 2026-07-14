@@ -9,8 +9,21 @@ pub struct ConnectionConfig {
     pub port: u16,
     pub user: String,
     pub database: String,
-    /// Whether to use SSL for the connection.
+    /// Legacy on/off SSL flag; superseded by ssl_mode when set.
     pub ssl: bool,
+    /// Postgres sslmode: "disable", "require", or "verify-full".
+    #[serde(default)]
+    pub ssl_mode: Option<String>,
+    /// Path to a CA certificate for verify-full.
+    #[serde(default)]
+    pub ssl_root_cert: Option<String>,
+    /// UI accent color for this connection (e.g. to mark prod red).
+    #[serde(default)]
+    pub color: Option<String>,
+    /// When true, sessions run with default_transaction_read_only=on
+    /// and the UI hides editing affordances.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// Config format for JSON files in ~/.config/bestgres/connections/.
@@ -29,6 +42,14 @@ pub struct ConnectionFileConfig {
     pub database: String,
     #[serde(default)]
     pub ssl: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_root_cert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// Information about a single table/view in the schema.
@@ -99,6 +120,15 @@ pub struct TableStructure {
     pub indexes: Vec<IndexInfo>,
     pub constraints: Vec<ConstraintInfo>,
     pub foreign_keys: Vec<ForeignKeyInfo>,
+}
+
+/// A single staged cell edit, identifying the row by its primary key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CellEdit {
+    pub column: String,
+    pub primary_key_columns: Vec<String>,
+    pub primary_key_values: Vec<serde_json::Value>,
+    pub new_value: serde_json::Value,
 }
 
 /// Result of executing a query — column names + rows of JSON values.

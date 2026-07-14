@@ -1,8 +1,9 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { QueryResult, ColumnInfo } from "@/types";
+import type { QueryResult, ColumnInfo, ForeignKeyInfo, CellEdit } from "@/types";
+import type { GridColumn } from "@/components/DataGrid";
 
-export const PAGE_SIZE = 100;
+export const PAGE_SIZE = 200;
 
 export type SortDirection = "asc" | "desc" | null;
 
@@ -21,6 +22,8 @@ interface TableDataArgs {
   database: string;
   schema: string;
   table: string;
+  readOnly: boolean;
+  initialFilters?: Record<string, string>;
 }
 
 interface WhereClause {
@@ -28,24 +31,34 @@ interface WhereClause {
   params: string[];
 }
 
-/**
- * Data layer for the table browser: fetching, pagination, sort/filter state,
- * and row mutations. Filter values are bound as query parameters, never
- * interpolated into SQL.
- */
-export function useTableData({ connectionId, database, schema, table }: TableDataArgs) {
+export function useTableData({
+  connectionId,
+  database,
+  schema,
+  table,
+  readOnly,
+  initialFilters,
+}: TableDataArgs) {
   const [rows, setRows] = useState<unknown[][]>([]);
   const [columnNames, setColumnNames] = useState<string[]>([]);
   const [columnTypes, setColumnTypes] = useState<Map<string, string>>(new Map());
   const [primaryKeyColumns, setPrimaryKeyColumns] = useState<string[]>([]);
+  const [foreignKeys, setForeignKeys] = useState<ForeignKeyInfo[]>([]);
   const [totalCount, setTotalCount] = useState<number | null>(null);
+  const [countIsEstimate, setCountIsEstimate] = useState(false);
   const [execTime, setExecTime] = useState(0);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sort, setSort] = useState<SortState>({ column: "", direction: null });
-  const [columnFilters, setColumnFilters] = useState<Record<string, string>>({});
+  const [columnFilters, setColumnFilters] = useState<Record<string, string>>(initialFilters ?? {});
   const [dataGeneration, setDataGeneration] = useState(0);
+  const [reloadKey, setReloadKey] = useState(0);
+  // True once a page returns fewer than PAGE_SIZE rows — the authoritative
+  // end-of-data signal (the row count may be an estimate and can't be trusted).
+  const [reachedEnd, setReachedEnd] = useState(false);
+  // Staged edits keyed `${rowIndex}:${colIndex}` → new value
+  const [pendingEdits, setPendingEdits] = useState<Map<string, string | null>>(new Map());
 
   const tableRef = `${quoteIdent(schema)}.${quoteIdent(table)}`;
 
@@ -64,84 +77,114 @@ export function useTableData({ connectionId, database, schema, table }: TableDat
         parts.push(`${quoteIdent(col)}::text ILIKE $${params.length}`);
       }
     }
-    return {
-      clause: parts.length > 0 ? ` WHERE ${parts.join(" AND ")}` : "",
-      params,
-    };
+    return { clause: parts.length ? ` WHERE ${parts.join(" AND ")}` : "", params };
   }, [columnFilters]);
 
-  const buildOrderClause = useCallback((): string => {
-    if (!sort.column || !sort.direction) return "";
-    return ` ORDER BY ${quoteIdent(sort.column)} ${sort.direction.toUpperCase()}`;
-  }, [sort]);
+  // Keyset pagination is used only in the common, correct-by-construction case:
+  // single scalar-typed PK, no user sort. Otherwise fall back to OFFSET.
+  // The PK param is bound as text, so it must be cast back to the column type
+  // (e.g. `$1::uuid`) — enum/domain/array PKs aren't safely castable, so skip them.
+  const pkType = primaryKeyColumns.length === 1 ? columnTypes.get(primaryKeyColumns[0]) : undefined;
+  const canKeyset =
+    primaryKeyColumns.length === 1 &&
+    !sort.column &&
+    !!pkType &&
+    pkType !== "USER-DEFINED" &&
+    pkType !== "ARRAY";
 
-  const fetchPage = useCallback(
-    (limit: number, offset = 0): Promise<QueryResult> => {
-      const where = buildWhere();
-      return invoke<QueryResult>("execute_query", {
+  // A STABLE order is required for correct pagination. Order by the sort column
+  // (tie-broken by PK), else by the full PK. Without a PK there's no stable order,
+  // so pagination may repeat rows — acceptable for keyless tables/views.
+  const orderClause = useCallback((): string => {
+    const pkOrder = primaryKeyColumns.map((c) => `${quoteIdent(c)} ASC`);
+    if (sort.column && sort.direction) {
+      const tieBreak = pkOrder.filter((_, i) => primaryKeyColumns[i] !== sort.column);
+      return ` ORDER BY ${[`${quoteIdent(sort.column)} ${sort.direction.toUpperCase()}`, ...tieBreak].join(", ")}`;
+    }
+    if (pkOrder.length > 0) return ` ORDER BY ${pkOrder.join(", ")}`;
+    return "";
+  }, [sort, primaryKeyColumns]);
+
+  const runQuery = useCallback(
+    (sql: string, params: string[]): Promise<QueryResult> =>
+      invoke<QueryResult>("execute_query", {
         connectionId,
         database,
-        sql: `SELECT * FROM ${tableRef}${where.clause}${buildOrderClause()} LIMIT ${limit} OFFSET ${offset}`,
-        params: where.params.length > 0 ? where.params : undefined,
-      });
-    },
-    [connectionId, database, tableRef, buildWhere, buildOrderClause]
+        sql,
+        params: params.length ? params : undefined,
+      }),
+    [connectionId, database]
   );
 
-  const fetchCount = useCallback((): Promise<QueryResult> => {
+  const fetchFirstPage = useCallback((): Promise<QueryResult> => {
     const where = buildWhere();
-    return invoke<QueryResult>("execute_query", {
-      connectionId,
-      database,
-      sql: `SELECT COUNT(*) FROM ${tableRef}${where.clause}`,
-      params: where.params.length > 0 ? where.params : undefined,
-    });
-  }, [connectionId, database, tableRef, buildWhere]);
+    return runQuery(`SELECT * FROM ${tableRef}${where.clause}${orderClause()} LIMIT ${PAGE_SIZE}`, where.params);
+  }, [tableRef, buildWhere, orderClause, runQuery]);
 
-  // Load metadata (columns, PK) and the first page — only when the table changes
+  const fetchExactCount = useCallback((): Promise<QueryResult> => {
+    const where = buildWhere();
+    return runQuery(`SELECT COUNT(*) FROM ${tableRef}${where.clause}`, where.params);
+  }, [tableRef, buildWhere, runQuery]);
+
+  // Initial load: metadata + first page + count estimate
   useEffect(() => {
     let cancelled = false;
-
-    async function loadMeta() {
+    async function load() {
       setLoading(true);
       setError(null);
       setRows([]);
       setColumnNames([]);
       setColumnTypes(new Map());
       setPrimaryKeyColumns([]);
+      setForeignKeys([]);
       setTotalCount(null);
+      setReachedEnd(false);
+      setPendingEdits(new Map());
       setSort({ column: "", direction: null });
-      setColumnFilters({});
+      setColumnFilters(initialFilters ?? {});
 
       try {
-        const [dataRes, colInfo, pkCols] = await Promise.all([
-          invoke<QueryResult>("execute_query", {
-            connectionId,
-            database,
-            sql: `SELECT * FROM ${quoteIdent(schema)}.${quoteIdent(table)} LIMIT ${PAGE_SIZE}`,
-          }),
+        // Metadata first so the first page can be ordered by the real PK —
+        // pagination needs the same stable ORDER BY as loadMore (else duplicates).
+        const [colInfo, pkCols, fks] = await Promise.all([
           invoke<ColumnInfo[]>("get_columns", { connectionId, database, schema, table }),
           invoke<string[]>("get_primary_key_columns", { connectionId, database, schema, table }),
+          invoke<ForeignKeyInfo[]>("get_foreign_keys", { connectionId, database, schema, table }),
         ]);
-
         if (cancelled) return;
-
-        setColumnNames(dataRes.columns);
-        setRows(dataRes.rows);
-        setExecTime(dataRes.execution_time_ms);
         setColumnTypes(new Map(colInfo.map((c) => [c.name, c.data_type])));
         setPrimaryKeyColumns(pkCols);
+        setForeignKeys(fks);
 
-        // COUNT(*) can be slow on big tables — fill it in without blocking first paint
-        invoke<QueryResult>("execute_query", {
+        const order = pkCols.length > 0
+          ? ` ORDER BY ${pkCols.map((c) => `${quoteIdent(c)} ASC`).join(", ")}`
+          : "";
+        const dataRes = await invoke<QueryResult>("execute_query", {
           connectionId,
           database,
-          sql: `SELECT COUNT(*) FROM ${quoteIdent(schema)}.${quoteIdent(table)}`,
-        })
-          .then((countRes) => {
+          sql: `SELECT * FROM ${tableRef}${order} LIMIT ${PAGE_SIZE}`,
+        });
+        if (cancelled) return;
+        setColumnNames(dataRes.columns);
+        setRows(dataRes.rows);
+        setReachedEnd(dataRes.rows.length < PAGE_SIZE);
+        setExecTime(dataRes.execution_time_ms);
+
+        // Fast estimate first; exact count is opt-in (click) to avoid slow COUNT(*)
+        invoke<number>("get_row_estimate", { connectionId, database, schema, table })
+          .then((est) => {
             if (cancelled) return;
-            const cnt = countRes.rows[0]?.[0];
-            if (cnt !== null && cnt !== undefined) setTotalCount(Number(cnt));
+            if (est >= 0) {
+              setTotalCount(est);
+              setCountIsEstimate(true);
+            } else {
+              // never analyzed — fall back to exact
+              fetchExactCount().then((r) => {
+                if (cancelled) return;
+                const c = r.rows[0]?.[0];
+                if (c != null) { setTotalCount(Number(c)); setCountIsEstimate(false); }
+              }).catch(() => {});
+            }
           })
           .catch(() => {});
       } catch (err) {
@@ -150,51 +193,81 @@ export function useTableData({ connectionId, database, schema, table }: TableDat
         if (!cancelled) setLoading(false);
       }
     }
+    load();
+    return () => { cancelled = true; };
+  }, [connectionId, database, schema, table, reloadKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    loadMeta();
-    return () => {
-      cancelled = true;
-    };
-  }, [connectionId, database, schema, table]);
+  const refresh = useCallback(() => setReloadKey((k) => k + 1), []);
 
-  // Refetch first page + count when sort/filter changes (not on initial load)
+  // Refetch on sort/filter change (exact count, since filters invalidate estimate)
   useEffect(() => {
     if (loading) return;
     let cancelled = false;
-
     async function refetch() {
       setError(null);
+      setPendingEdits(new Map());
       try {
-        const [dataRes, countRes] = await Promise.all([fetchPage(PAGE_SIZE), fetchCount()]);
+        const dataRes = await fetchFirstPage();
         if (cancelled) return;
         setRows(dataRes.rows);
+        setReachedEnd(dataRes.rows.length < PAGE_SIZE);
         setExecTime(dataRes.execution_time_ms);
-        const cnt = countRes.rows[0]?.[0];
-        if (cnt !== null && cnt !== undefined) setTotalCount(Number(cnt));
+        const hasFilters = Object.values(columnFilters).some((v) => v.trim());
+        if (hasFilters || sort.column) {
+          const countRes = await fetchExactCount();
+          if (cancelled) return;
+          const c = countRes.rows[0]?.[0];
+          if (c != null) { setTotalCount(Number(c)); setCountIsEstimate(false); }
+        }
       } catch (err) {
         if (!cancelled) setError(String(err));
       }
     }
-
     refetch();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataGeneration]);
+    return () => { cancelled = true; };
+  }, [dataGeneration]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadMore = useCallback(async () => {
-    if (loadingMore) return;
+    if (loadingMore || reachedEnd) return;
     setLoadingMore(true);
     try {
-      const res = await fetchPage(PAGE_SIZE, rows.length);
+      const where = buildWhere();
+      let res: QueryResult;
+      if (canKeyset && rows.length > 0) {
+        // Keyset: WHERE pk > last seen pk — no OFFSET re-scan.
+        // Cast the placeholder to the PK type since params bind as text
+        // (e.g. uuid > $1::uuid, not uuid > text).
+        const pkCol = primaryKeyColumns[0];
+        const pkIdx = columnNames.indexOf(pkCol);
+        const lastPk = rows[rows.length - 1][pkIdx];
+        const ksParams = [...where.params, String(lastPk)];
+        const cmp = `${quoteIdent(pkCol)} > $${ksParams.length}::${pkType}`;
+        const ksClause = where.clause ? `${where.clause} AND ${cmp}` : ` WHERE ${cmp}`;
+        res = await runQuery(`SELECT * FROM ${tableRef}${ksClause}${orderClause()} LIMIT ${PAGE_SIZE}`, ksParams);
+      } else {
+        res = await runQuery(
+          `SELECT * FROM ${tableRef}${where.clause}${orderClause()} LIMIT ${PAGE_SIZE} OFFSET ${rows.length}`,
+          where.params
+        );
+      }
+      if (res.rows.length < PAGE_SIZE) setReachedEnd(true);
       setRows((prev) => [...prev, ...res.rows]);
     } catch (err) {
       setError(String(err));
     } finally {
       setLoadingMore(false);
     }
-  }, [loadingMore, rows.length, fetchPage]);
+  }, [loadingMore, reachedEnd, buildWhere, canKeyset, pkType, rows, primaryKeyColumns, columnNames, tableRef, orderClause, runQuery]);
+
+  const loadExactCount = useCallback(async () => {
+    try {
+      const r = await fetchExactCount();
+      const c = r.rows[0]?.[0];
+      if (c != null) { setTotalCount(Number(c)); setCountIsEstimate(false); }
+    } catch (err) {
+      setError(String(err));
+    }
+  }, [fetchExactCount]);
 
   const toggleSort = useCallback((col: string) => {
     setSort((prev) => {
@@ -205,93 +278,124 @@ export function useTableData({ connectionId, database, schema, table }: TableDat
     setDataGeneration((g) => g + 1);
   }, []);
 
-  const filterDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
+  const filterDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
   const setFilter = useCallback((col: string, value: string) => {
     setColumnFilters((prev) => ({ ...prev, [col]: value }));
-    if (filterDebounceRef.current) clearTimeout(filterDebounceRef.current);
-    filterDebounceRef.current = setTimeout(() => {
-      setDataGeneration((g) => g + 1);
-    }, 400);
+    if (filterDebounce.current) clearTimeout(filterDebounce.current);
+    filterDebounce.current = setTimeout(() => setDataGeneration((g) => g + 1), 400);
   }, []);
 
   const clearFilters = useCallback(() => {
     setColumnFilters({});
-    if (filterDebounceRef.current) clearTimeout(filterDebounceRef.current);
+    if (filterDebounce.current) clearTimeout(filterDebounce.current);
     setDataGeneration((g) => g + 1);
   }, []);
 
-  /* ── Row identity (for selection / deletes) ── */
-
-  const getRowId = useCallback(
-    (row: Record<string, unknown>) => {
-      if (primaryKeyColumns.length === 0) return "";
-      return primaryKeyColumns.map((pk) => JSON.stringify(row[pk] ?? null)).join("\x01");
+  /* ── Row identity for selection / edits ── */
+  const getRowKey = useCallback(
+    (rowIndex: number) => {
+      if (primaryKeyColumns.length === 0) return String(rowIndex);
+      const row = rows[rowIndex];
+      return primaryKeyColumns
+        .map((pk) => JSON.stringify(row[columnNames.indexOf(pk)] ?? null))
+        .join("\x01");
     },
-    [primaryKeyColumns]
+    [primaryKeyColumns, rows, columnNames]
   );
 
-  /* ── Mutations ── */
+  const pkValuesForRow = useCallback(
+    (rowIndex: number) =>
+      primaryKeyColumns.map((pk) => {
+        const i = columnNames.indexOf(pk);
+        return i >= 0 ? rows[rowIndex][i] ?? null : null;
+      }),
+    [primaryKeyColumns, columnNames, rows]
+  );
 
-  const rowsRef = useRef(rows);
-  rowsRef.current = rows;
+  /* ── Staged edits ── */
+  const stageEdit = useCallback((rowIndex: number, colIndex: number, value: string | null) => {
+    setPendingEdits((prev) => {
+      const next = new Map(prev);
+      next.set(`${rowIndex}:${colIndex}`, value);
+      return next;
+    });
+  }, []);
 
-  /** Throws on failure so the caller (EditableCell) can show the error inline. */
-  const updateCell = useCallback(
-    async (rowIndex: number, columnName: string, newValue: string | null) => {
-      const rowArr = rowsRef.current[rowIndex];
-      if (!rowArr) return;
-      const pkValues = primaryKeyColumns.map((pk) => {
-        const colIndex = columnNames.indexOf(pk);
-        return colIndex >= 0 ? rowArr[colIndex] ?? null : null;
+  const discardEdits = useCallback(() => setPendingEdits(new Map()), []);
+
+  const buildEdits = useCallback((): CellEdit[] => {
+    const edits: CellEdit[] = [];
+    for (const [key, value] of pendingEdits) {
+      const [r, c] = key.split(":").map(Number);
+      edits.push({
+        column: columnNames[c],
+        primary_key_columns: primaryKeyColumns,
+        primary_key_values: pkValuesForRow(r),
+        new_value: value,
       });
+    }
+    return edits;
+  }, [pendingEdits, columnNames, primaryKeyColumns, pkValuesForRow]);
+
+  const previewEdits = useCallback(
+    () => invoke<string>("preview_cell_edits", { connectionId, database, schema, table, edits: buildEdits() }),
+    [connectionId, database, schema, table, buildEdits]
+  );
+
+  const applyEdits = useCallback(async () => {
+    await invoke("apply_cell_edits", { connectionId, database, schema, table, edits: buildEdits() });
+    // Merge staged values into local rows, then clear
+    setRows((prev) => {
+      const next = prev.map((r) => [...r]);
+      for (const [key, value] of pendingEdits) {
+        const [r, c] = key.split(":").map(Number);
+        if (next[r]) next[r][c] = value;
+      }
+      return next;
+    });
+    setPendingEdits(new Map());
+  }, [connectionId, database, schema, table, buildEdits, pendingEdits]);
+
+  /* ── Immediate (quick-mode) single-cell write ── */
+  const updateCellNow = useCallback(
+    async (rowIndex: number, colIndex: number, value: string | null) => {
       await invoke("update_cell", {
         connectionId,
         database,
         schema,
         table,
-        column: columnName,
+        column: columnNames[colIndex],
         primaryKeyColumns,
-        primaryKeyValues: pkValues,
-        newValue,
+        primaryKeyValues: pkValuesForRow(rowIndex),
+        newValue: value,
       });
-      const colIndex = columnNames.indexOf(columnName);
-      if (colIndex === -1) return;
       setRows((prev) => {
-        const next = [...prev];
-        const rowCopy = [...next[rowIndex]];
-        rowCopy[colIndex] = newValue;
-        next[rowIndex] = rowCopy;
+        const next = prev.map((r) => [...r]);
+        if (next[rowIndex]) next[rowIndex][colIndex] = value;
         return next;
       });
     },
-    [connectionId, database, schema, table, primaryKeyColumns, columnNames]
+    [connectionId, database, schema, table, columnNames, primaryKeyColumns, pkValuesForRow]
   );
 
-  /** Throws on failure. On success refetches the first page. */
   const insertRow = useCallback(
     async (columns: string[], values: (string | null)[]) => {
       await invoke("insert_row", { connectionId, database, schema, table, columns, values });
       setTotalCount((c) => (c !== null ? c + 1 : null));
-      const res = await fetchPage(PAGE_SIZE);
+      const res = await fetchFirstPage();
       setRows(res.rows);
     },
-    [connectionId, database, schema, table, fetchPage]
+    [connectionId, database, schema, table, fetchFirstPage]
   );
 
-  /** Delete rows by their getRowId ids. Throws on failure. */
-  const deleteRowsByIds = useCallback(
-    async (selectedIds: string[]) => {
-      if (selectedIds.length === 0) return;
-      const pkValuesList = selectedIds.map((id) =>
-        id.split("\x01").map((p) => {
-          try {
-            return JSON.parse(p) as unknown;
-          } catch {
-            return p;
-          }
-        })
-      );
+  const deleteRowsByKeys = useCallback(
+    async (selectedKeys: string[]) => {
+      if (selectedKeys.length === 0) return;
+      const keySet = new Set(selectedKeys);
+      const pkValuesList: unknown[][] = [];
+      rows.forEach((_, i) => {
+        if (keySet.has(getRowKey(i))) pkValuesList.push(pkValuesForRow(i));
+      });
       try {
         await invoke("delete_rows", {
           connectionId,
@@ -305,44 +409,47 @@ export function useTableData({ connectionId, database, schema, table }: TableDat
         setError(String(err));
         throw err;
       }
-      const ids = new Set(selectedIds);
-      setRows((prev) =>
-        prev.filter((row) => {
-          const id = primaryKeyColumns
-            .map((pk) => {
-              const colIdx = columnNames.indexOf(pk);
-              return JSON.stringify((colIdx >= 0 ? row[colIdx] : null) ?? null);
-            })
-            .join("\x01");
-          return !ids.has(id);
-        })
-      );
-      setTotalCount((c) => (c !== null ? Math.max(0, c - selectedIds.length) : null));
+      setRows((prev) => prev.filter((_, i) => !keySet.has(getRowKey(i))));
+      setTotalCount((c) => (c !== null ? Math.max(0, c - pkValuesList.length) : null));
     },
-    [connectionId, database, schema, table, primaryKeyColumns, columnNames]
+    [connectionId, database, schema, table, primaryKeyColumns, rows, getRowKey, pkValuesForRow]
   );
 
-  /* ── Derived ── */
+  /* ── Grid columns ── */
+  const fkByColumn = useMemo(() => {
+    const m = new Map<string, ForeignKeyInfo>();
+    for (const fk of foreignKeys) m.set(fk.column_name, fk);
+    return m;
+  }, [foreignKeys]);
 
-  const data: Record<string, unknown>[] = useMemo(
+  const canEdit = !readOnly && primaryKeyColumns.length > 0;
+
+  const gridColumns: GridColumn[] = useMemo(
     () =>
-      rows.map((row) => {
-        const obj: Record<string, unknown> = {};
-        columnNames.forEach((col, i) => {
-          obj[col] = row[i];
-        });
-        return obj;
+      columnNames.map((name) => {
+        const isPk = primaryKeyColumns.includes(name);
+        const fk = fkByColumn.get(name);
+        return {
+          name,
+          type: columnTypes.get(name),
+          isPrimaryKey: isPk,
+          editable: canEdit && !isPk,
+          sortDirection: sort.column === name ? sort.direction : null,
+          fk: fk ? { ref_schema: fk.ref_schema, ref_table: fk.ref_table, ref_column: fk.ref_column } : undefined,
+        };
       }),
-    [rows, columnNames]
+    [columnNames, columnTypes, primaryKeyColumns, fkByColumn, canEdit, sort]
   );
 
   return {
-    data,
-    rowCount: rows.length,
+    rows,
+    gridColumns,
     columnNames,
     columnTypes,
     primaryKeyColumns,
     totalCount,
+    countIsEstimate,
+    loadExactCount,
     execTime,
     loading,
     loadingMore,
@@ -353,11 +460,21 @@ export function useTableData({ connectionId, database, schema, table }: TableDat
     columnFilters,
     setFilter,
     clearFilters,
-    hasMore: totalCount !== null && rows.length < totalCount,
+    hasMore: !reachedEnd,
     loadMore,
-    getRowId,
-    updateCell,
+    refresh,
+    getRowKey,
+    canEdit,
+    // staged edits
+    pendingEdits,
+    pendingCount: pendingEdits.size,
+    stageEdit,
+    discardEdits,
+    previewEdits,
+    applyEdits,
+    // immediate
+    updateCellNow,
     insertRow,
-    deleteRowsByIds,
+    deleteRowsByKeys,
   };
 }

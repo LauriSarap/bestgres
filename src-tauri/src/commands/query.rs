@@ -1,9 +1,16 @@
+use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::commands::connection::{get_or_create_db_pool, AppState};
 use crate::db::postgres;
-use crate::models::{AppError, ColumnInfo, QueryResult, SchemaObject, TableStructure};
+use crate::db::postgres::{StreamEvent, StreamSummary};
+use crate::models::{
+    AppError, CellEdit, ColumnInfo, ForeignKeyInfo, QueryResult, SchemaObject, TableStructure,
+};
 use serde_json::Value as JsonValue;
+
+/// Rows per chunk streamed to the frontend.
+const STREAM_CHUNK_SIZE: usize = 500;
 
 /// List all databases on the server for a connection.
 #[tauri::command]
@@ -87,8 +94,91 @@ pub async fn execute_query(
     postgres::execute_query(&pool, &sql, &params.unwrap_or_default()).await
 }
 
+/// Execute SQL and stream columns + row chunks to the frontend over `on_event`.
+/// Returns a summary (final columns, row count, rows affected, truncated, time)
+/// once complete.
+#[tauri::command]
+pub async fn execute_query_stream(
+    state: State<'_, AppState>,
+    connection_id: String,
+    database: String,
+    sql: String,
+    params: Option<Vec<JsonValue>>,
+    on_event: Channel<StreamEvent>,
+) -> Result<StreamSummary, AppError> {
+    let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
+    postgres::execute_query_stream(
+        &pool,
+        &sql,
+        &params.unwrap_or_default(),
+        STREAM_CHUNK_SIZE,
+        |event| {
+            on_event
+                .send(event)
+                .map_err(|e| AppError::Database(format!("Channel send failed: {}", e)))
+        },
+    )
+    .await
+}
+
+/// Get the planner's estimated row count for a table (instant, from pg_class).
+/// Returns -1 if the table has never been analyzed.
+#[tauri::command]
+pub async fn get_row_estimate(
+    state: State<'_, AppState>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    table: String,
+) -> Result<i64, AppError> {
+    let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
+    postgres::get_row_estimate(&pool, &schema, &table).await
+}
+
+/// Get foreign key relationships for a table.
+#[tauri::command]
+pub async fn get_foreign_keys(
+    state: State<'_, AppState>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    table: String,
+) -> Result<Vec<ForeignKeyInfo>, AppError> {
+    let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
+    postgres::get_foreign_keys(&pool, &schema, &table).await
+}
+
+/// Apply a batch of staged cell edits in a single transaction.
+#[tauri::command]
+pub async fn apply_cell_edits(
+    state: State<'_, AppState>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    table: String,
+    edits: Vec<CellEdit>,
+) -> Result<u64, AppError> {
+    let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
+    postgres::apply_cell_edits(&pool, &schema, &table, &edits).await
+}
+
+/// Build human-readable SQL for a set of staged edits (for preview).
+#[tauri::command]
+pub async fn preview_cell_edits(
+    state: State<'_, AppState>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    table: String,
+    edits: Vec<CellEdit>,
+) -> Result<String, AppError> {
+    let pool = get_or_create_db_pool(&state, &connection_id, &database).await?;
+    postgres::preview_cell_edits(&pool, &schema, &table, &edits).await
+}
+
 /// Update a single cell value in a table. Requires a primary key to identify the row.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn update_cell(
     state: State<'_, AppState>,
     connection_id: String,

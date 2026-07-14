@@ -26,7 +26,13 @@ fn connection_filename(config: &ConnectionConfig) -> String {
     let safe_name: String = config
         .name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
         .to_lowercase();
     if safe_name.is_empty() {
@@ -49,12 +55,79 @@ fn save_connection_to_file(config: &ConnectionConfig) -> Result<(), AppError> {
         password: None,
         database: config.database.clone(),
         ssl: config.ssl,
+        ssl_mode: config.ssl_mode.clone(),
+        ssl_root_cert: config.ssl_root_cert.clone(),
+        color: config.color.clone(),
+        read_only: config.read_only,
     };
     let json = serde_json::to_string_pretty(&file_config)
         .map_err(|e| AppError::Config(format!("Cannot serialize config: {}", e)))?;
     std::fs::write(dir.join(connection_filename(config)), json)
         .map_err(|e| AppError::Config(format!("Cannot write config file: {}", e)))?;
     Ok(())
+}
+
+struct PreparedConnection {
+    config: ConnectionConfig,
+    password: Option<String>,
+    should_rewrite: bool,
+}
+
+/// Convert a connection file into runtime metadata and resolve its credential.
+/// Metadata is always returned, even when the credential is unavailable, so a
+/// saved connection remains visible and can be repaired by editing it.
+fn prepare_connection<G, S>(
+    file_config: ConnectionFileConfig,
+    get_stored_password: G,
+    store_stored_password: S,
+) -> PreparedConnection
+where
+    G: FnOnce(&str) -> Result<String, AppError>,
+    S: FnOnce(&str, &str) -> Result<(), AppError>,
+{
+    let generated_id = file_config.id.is_none();
+    let id = file_config
+        .id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let legacy_password = file_config.password.clone();
+
+    let config = ConnectionConfig {
+        id: id.clone(),
+        name: file_config.name,
+        host: file_config.host,
+        port: file_config.port,
+        user: file_config.user,
+        database: file_config.database,
+        ssl: file_config.ssl,
+        ssl_mode: file_config.ssl_mode,
+        ssl_root_cert: file_config.ssl_root_cert,
+        color: file_config.color,
+        read_only: file_config.read_only,
+    };
+
+    let mut migrated_legacy_password = false;
+    let password = match get_stored_password(&id) {
+        Ok(password) => Some(password),
+        Err(_) => match legacy_password.as_deref() {
+            Some(password) if store_stored_password(&id, password).is_ok() => {
+                migrated_legacy_password = true;
+                Some(password.to_owned())
+            }
+            _ => None,
+        },
+    };
+
+    let should_rewrite = migrated_legacy_password
+        || (generated_id && legacy_password.is_none() && password.is_some());
+
+    PreparedConnection {
+        config,
+        password,
+        // Never remove the only copy of a legacy password unless migration
+        // into the platform credential store succeeded.
+        should_rewrite,
+    }
 }
 
 /// Delete the config file for a connection by trying to match by name.
@@ -85,20 +158,54 @@ impl AppState {
     }
 }
 
-/// Build a connection string from config fields.
+/// Percent-encode a connection string component (RFC 3986 unreserved set).
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Build a connection string for a config, targeting `database`
+/// (which may differ from the config's default database).
 pub fn build_connection_string(
-    host: &str,
-    port: u16,
-    user: &str,
+    config: &ConnectionConfig,
     password: &str,
     database: &str,
-    ssl: bool,
 ) -> String {
-    let ssl_mode = if ssl { "require" } else { "disable" };
-    format!(
+    let ssl_mode = match config.ssl_mode.as_deref() {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            if config.ssl {
+                "require"
+            } else {
+                "disable"
+            }
+        }
+    };
+    let mut url = format!(
         "postgres://{}:{}@{}:{}/{}?sslmode={}",
-        user, password, host, port, database, ssl_mode
-    )
+        pct_encode(&config.user),
+        pct_encode(password),
+        config.host,
+        config.port,
+        pct_encode(database),
+        ssl_mode
+    );
+    if let Some(cert) = config.ssl_root_cert.as_deref().filter(|c| !c.is_empty()) {
+        url.push_str(&format!("&sslrootcert={}", pct_encode(cert)));
+    }
+    if config.read_only {
+        // Enforced server-side: every session opens read-only
+        url.push_str("&options=-c%20default_transaction_read_only%3Don");
+    }
+    url
 }
 
 /// Store a password in the system keychain.
@@ -153,14 +260,7 @@ pub async fn get_or_create_db_pool(
 
     // Create a new pool for this database
     let password = get_password(connection_id)?;
-    let conn_str = build_connection_string(
-        &config.host,
-        config.port,
-        &config.user,
-        &password,
-        database,
-        config.ssl,
-    );
+    let conn_str = build_connection_string(&config, &password, database);
     let pool = postgres::create_pool(&conn_str).await?;
 
     let mut pools = state.pools.lock().await;
@@ -181,17 +281,10 @@ pub async fn add_connection(
     store_password(&config.id, &password)?;
 
     // Persist to config file (password stays in the keychain only)
-    let _ = save_connection_to_file(&config);
+    save_connection_to_file(&config)?;
 
     // Try to connect — save the connection regardless of outcome
-    let conn_str = build_connection_string(
-        &config.host,
-        config.port,
-        &config.user,
-        &password,
-        &config.database,
-        config.ssl,
-    );
+    let conn_str = build_connection_string(&config, &password, &config.database);
     if let Ok(pool) = postgres::create_pool_lazy(&conn_str) {
         let mut pools = state.pools.lock().await;
         pools.insert(config.id.clone(), pool);
@@ -224,16 +317,18 @@ pub async fn update_connection(
         store_password(&config.id, &password)?;
     }
 
-    // Delete old config file (old name may differ)
-    {
+    // Persist the new file before removing an old renamed file. A failed write
+    // must not silently destroy the last good copy of the connection metadata.
+    let old_config = {
         let connections = state.connections.lock().await;
-        if let Some(old) = connections.iter().find(|c| c.id == config.id) {
-            let _ = delete_connection_file(old);
+        connections.iter().find(|c| c.id == config.id).cloned()
+    };
+    save_connection_to_file(&config)?;
+    if let Some(old) = old_config {
+        if connection_filename(&old) != connection_filename(&config) {
+            delete_connection_file(&old)?;
         }
     }
-
-    // Persist updated config
-    let _ = save_connection_to_file(&config);
 
     // Close old pools for this connection
     {
@@ -251,14 +346,7 @@ pub async fn update_connection(
     }
 
     // Create a lazy pool for the updated config
-    let conn_str = build_connection_string(
-        &config.host,
-        config.port,
-        &config.user,
-        &effective_password,
-        &config.database,
-        config.ssl,
-    );
+    let conn_str = build_connection_string(&config, &effective_password, &config.database);
     if let Ok(pool) = postgres::create_pool_lazy(&conn_str) {
         let mut pools = state.pools.lock().await;
         pools.insert(config.id.clone(), pool);
@@ -283,7 +371,7 @@ pub async fn remove_connection(
     {
         let connections = state.connections.lock().await;
         if let Some(config) = connections.iter().find(|c| c.id == connection_id) {
-            let _ = delete_connection_file(config);
+            delete_connection_file(config)?;
         }
     }
 
@@ -311,10 +399,7 @@ pub async fn remove_connection(
 
 /// Connect to an existing saved connection.
 #[tauri::command]
-pub async fn connect(
-    state: State<'_, AppState>,
-    connection_id: String,
-) -> Result<(), AppError> {
+pub async fn connect(state: State<'_, AppState>, connection_id: String) -> Result<(), AppError> {
     let connections = state.connections.lock().await;
     let config = connections
         .iter()
@@ -324,14 +409,7 @@ pub async fn connect(
     drop(connections);
 
     let password = get_password(&connection_id)?;
-    let conn_str = build_connection_string(
-        &config.host,
-        config.port,
-        &config.user,
-        &password,
-        &config.database,
-        config.ssl,
-    );
+    let conn_str = build_connection_string(&config, &password, &config.database);
     let pool = postgres::create_pool(&conn_str).await?;
     postgres::test_connection(&pool).await?;
 
@@ -343,10 +421,7 @@ pub async fn connect(
 
 /// Disconnect and remove a pool.
 #[tauri::command]
-pub async fn disconnect(
-    state: State<'_, AppState>,
-    connection_id: String,
-) -> Result<(), AppError> {
+pub async fn disconnect(state: State<'_, AppState>, connection_id: String) -> Result<(), AppError> {
     let mut pools = state.pools.lock().await;
     let keys_to_remove: Vec<String> = pools
         .keys()
@@ -383,6 +458,26 @@ pub async fn check_connection(
     )
     .await;
     Ok(matches!(probe, Ok(Ok(()))))
+}
+
+/// Test a connection's settings without saving it. Returns Ok on success,
+/// or an error string describing why the connection failed.
+#[tauri::command]
+pub async fn test_connection_config(
+    config: ConnectionConfig,
+    password: String,
+) -> Result<(), AppError> {
+    // If editing, an empty password means "use the stored one"
+    let effective_password = if password.is_empty() {
+        get_password(&config.id).unwrap_or_default()
+    } else {
+        password
+    };
+    let conn_str = build_connection_string(&config, &effective_password, &config.database);
+    let pool = postgres::create_pool(&conn_str).await?;
+    let result = postgres::test_connection(&pool).await;
+    pool.close().await;
+    result
 }
 
 /// List all saved connections.
@@ -430,53 +525,23 @@ pub async fn load_config_connections(
             Err(_) => continue,
         };
 
-        let id = file_config
-            .id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-        let config = ConnectionConfig {
-            id: id.clone(),
-            name: file_config.name,
-            host: file_config.host,
-            port: file_config.port,
-            user: file_config.user,
-            database: file_config.database,
-            ssl: file_config.ssl,
-        };
-
-        // Resolve the password: keychain first, falling back to a legacy
-        // inline password (which we then migrate into the keychain).
-        let password = match get_password(&id) {
-            Ok(p) => p,
-            Err(_) => match &file_config.password {
-                Some(p) => {
-                    if store_password(&id, p).is_err() {
-                        continue;
-                    }
-                    p.clone()
-                }
-                None => continue, // no usable credentials
-            },
-        };
+        let prepared = prepare_connection(file_config, get_password, store_password);
+        let config = prepared.config;
+        let id = config.id.clone();
 
         // Rewrite the file if it's missing the stable id or still has the password inline
-        if file_config.id.is_none() || file_config.password.is_some() {
-            let _ = save_connection_to_file(&config);
+        if prepared.should_rewrite {
+            save_connection_to_file(&config)?;
         }
 
-        // Create a lazy pool — doesn't actually connect until first query.
-        // This ensures the connection always appears in the sidebar instantly.
-        let conn_str = build_connection_string(
-            &config.host,
-            config.port,
-            &config.user,
-            &password,
-            &config.database,
-            config.ssl,
-        );
-        if let Ok(pool) = postgres::create_pool_lazy(&conn_str) {
-            new_pools.push((id, pool));
+        // A missing credential no longer hides saved metadata. The connection
+        // stays visible without a pool until the user edits it and re-enters
+        // the password once.
+        if let Some(password) = prepared.password {
+            let conn_str = build_connection_string(&config, &password, &config.database);
+            if let Ok(pool) = postgres::create_pool_lazy(&conn_str) {
+                new_pools.push((id, pool));
+            }
         }
 
         loaded.push(config);
@@ -499,4 +564,89 @@ pub async fn load_config_connections(
     }
 
     Ok(loaded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_config(password: Option<&str>) -> ConnectionFileConfig {
+        ConnectionFileConfig {
+            id: Some("connection-id".into()),
+            name: "Saved connection".into(),
+            host: "localhost".into(),
+            port: 5432,
+            user: "postgres".into(),
+            password: password.map(str::to_owned),
+            database: "postgres".into(),
+            ssl: false,
+            ssl_mode: None,
+            ssl_root_cert: None,
+            color: None,
+            read_only: false,
+        }
+    }
+
+    #[test]
+    fn saved_metadata_remains_visible_when_password_is_missing() {
+        let prepared = prepare_connection(
+            file_config(None),
+            |_| Err(AppError::Keychain("missing".into())),
+            |_, _| Ok(()),
+        );
+
+        assert_eq!(prepared.config.id, "connection-id");
+        assert_eq!(prepared.config.name, "Saved connection");
+        assert!(prepared.password.is_none());
+        assert!(!prepared.should_rewrite);
+    }
+
+    #[test]
+    fn stored_password_is_used_without_rewriting_metadata() {
+        let prepared = prepare_connection(
+            file_config(None),
+            |_| Ok("secret".into()),
+            |_, _| panic!("legacy migration should not run"),
+        );
+
+        assert_eq!(prepared.password.as_deref(), Some("secret"));
+        assert!(!prepared.should_rewrite);
+    }
+
+    #[test]
+    fn legacy_inline_password_is_migrated_and_removed_from_disk() {
+        let prepared = prepare_connection(
+            file_config(Some("legacy-secret")),
+            |_| Err(AppError::Keychain("missing".into())),
+            |id, password| {
+                assert_eq!(id, "connection-id");
+                assert_eq!(password, "legacy-secret");
+                Ok(())
+            },
+        );
+
+        assert_eq!(prepared.password.as_deref(), Some("legacy-secret"));
+        assert!(prepared.should_rewrite);
+    }
+
+    #[test]
+    fn failed_legacy_migration_keeps_inline_password_file_unchanged() {
+        let prepared = prepare_connection(
+            file_config(Some("legacy-secret")),
+            |_| Err(AppError::Keychain("missing".into())),
+            |_, _| Err(AppError::Keychain("locked".into())),
+        );
+
+        assert!(prepared.password.is_none());
+        assert!(!prepared.should_rewrite);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_uses_the_reboot_persistent_secret_service_backend() {
+        let entry = keyring::Entry::new("bestgres", "backend-test").unwrap();
+        assert!(entry
+            .get_credential()
+            .is::<keyring::secret_service::SsCredential>());
+    }
 }

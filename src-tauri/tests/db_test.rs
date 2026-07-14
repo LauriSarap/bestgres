@@ -8,7 +8,9 @@ const TEST_URL: &str = "postgres://postgres:postgres@127.0.0.1:5433/analytics";
 
 /// Each test gets its own table/type (suffix) so parallel tests don't collide.
 async fn setup(sfx: &str) -> sqlx::PgPool {
-    let pool = postgres::create_pool(TEST_URL).await.expect("connect to dev pg2");
+    let pool = postgres::create_pool(TEST_URL)
+        .await
+        .expect("connect to dev pg2");
     sqlx::query(&format!("DROP TABLE IF EXISTS _bestgres_test{sfx}"))
         .execute(&pool)
         .await
@@ -17,10 +19,12 @@ async fn setup(sfx: &str) -> sqlx::PgPool {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query(&format!("CREATE TYPE _bestgres_mood{sfx} AS ENUM ('happy', 'sad')"))
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(&format!(
+        "CREATE TYPE _bestgres_mood{sfx} AS ENUM ('happy', 'sad')"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query(&format!(
         r#"
         CREATE TABLE _bestgres_test{sfx} (
@@ -83,10 +87,17 @@ async fn decodes_all_column_types() {
     assert_eq!(get("tags"), &json!(["x", "y"]));
     assert_eq!(get("nums"), &json!([1, 2, 3]));
     assert_eq!(get("bin"), &json!("\\xdeadbeef"));
-    assert_eq!(get("mood"), &json!("happy"), "enum should decode via unchecked fallback");
+    assert_eq!(
+        get("mood"),
+        &json!("happy"),
+        "enum should decode via unchecked fallback"
+    );
     assert_eq!(get("iv"), &json!("1 days 02:30:00"));
     assert_eq!(get("txt"), &json!("hello"));
-    assert!(get("ts").as_str().unwrap().starts_with("2026-01-02T03:04:05"));
+    assert!(get("ts")
+        .as_str()
+        .unwrap()
+        .starts_with("2026-01-02T03:04:05"));
     assert_eq!(get("d"), &json!("2026-01-02"));
 
     // The all-NULL row must be NULL everywhere (not placeholders)
@@ -110,9 +121,17 @@ async fn update_cell_casts_types_with_int_pk() {
     let pk_vals = vec![json!(1)];
 
     // numeric column, value typed as a string in the UI
-    let n = postgres::update_cell(&pool, "public", table, "price", &pk_cols, &pk_vals, &json!("999.9999"))
-        .await
-        .unwrap();
+    let n = postgres::update_cell(
+        &pool,
+        "public",
+        table,
+        "price",
+        &pk_cols,
+        &pk_vals,
+        &json!("999.9999"),
+    )
+    .await
+    .unwrap();
     assert_eq!(n, 1);
 
     // boolean, timestamptz, jsonb, enum, array, quoted identifier — all typed as strings
@@ -131,9 +150,17 @@ async fn update_cell_casts_types_with_int_pk() {
     }
 
     // set a column to NULL
-    let n = postgres::update_cell(&pool, "public", table, "txt", &pk_cols, &pk_vals, &Value::Null)
-        .await
-        .unwrap();
+    let n = postgres::update_cell(
+        &pool,
+        "public",
+        table,
+        "txt",
+        &pk_cols,
+        &pk_vals,
+        &Value::Null,
+    )
+    .await
+    .unwrap();
     assert_eq!(n, 1);
 
     let res = postgres::execute_query(
@@ -152,7 +179,16 @@ async fn update_cell_casts_types_with_int_pk() {
     assert_eq!(res.rows[0][6], json!("edited"));
 
     // updating a non-existent row must error, not silently succeed
-    let err = postgres::update_cell(&pool, "public", table, "txt", &pk_cols, &[json!(99999)], &json!("x")).await;
+    let err = postgres::update_cell(
+        &pool,
+        "public",
+        table,
+        "txt",
+        &pk_cols,
+        &[json!(99999)],
+        &json!("x"),
+    )
+    .await;
     assert!(err.is_err());
 }
 
@@ -167,15 +203,24 @@ async fn insert_and_delete_with_casts() {
         "public",
         table,
         &["price".into(), "flag".into(), "nums".into(), "txt".into()],
-        &[json!("1.5"), json!("true"), json!("{7,8}"), json!("inserted")],
+        &[
+            json!("1.5"),
+            json!("true"),
+            json!("{7,8}"),
+            json!("inserted"),
+        ],
     )
     .await
     .unwrap();
     assert_eq!(n, 1);
 
-    let res = postgres::execute_query(&pool, "SELECT id, price, nums FROM _bestgres_test_ins WHERE txt = 'inserted'", &[])
-        .await
-        .unwrap();
+    let res = postgres::execute_query(
+        &pool,
+        "SELECT id, price, nums FROM _bestgres_test_ins WHERE txt = 'inserted'",
+        &[],
+    )
+    .await
+    .unwrap();
     assert_eq!(res.row_count, 1);
     let new_id = res.rows[0][0].clone();
     assert_eq!(res.rows[0][1], json!("1.5000"));
@@ -208,13 +253,18 @@ async fn multi_statement_params_truncation_and_affected() {
     assert_eq!(res.rows[0][0], json!("two"));
 
     // DML reports affected rows; a trailing SELECT still returns its result set
-    let sql = format!("UPDATE {t} SET txt = 'bulk'; SELECT count(*) FROM {t}", t = table);
+    let sql = format!(
+        "UPDATE {t} SET txt = 'bulk'; SELECT count(*) FROM {t}",
+        t = table
+    );
     let res = postgres::execute_query(&pool, &sql, &[]).await.unwrap();
     assert_eq!(res.rows_affected, 2);
     assert_eq!(res.rows[0][0], json!(2));
 
     // semicolons inside strings must not split statements
-    let res = postgres::execute_query(&pool, "SELECT 'a;b' AS s", &[]).await.unwrap();
+    let res = postgres::execute_query(&pool, "SELECT 'a;b' AS s", &[])
+        .await
+        .unwrap();
     assert_eq!(res.rows[0][0], json!("a;b"));
 
     // results are capped at MAX_QUERY_ROWS and flagged truncated
@@ -229,4 +279,161 @@ async fn multi_statement_params_truncation_and_affected() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("Statement 2 of 2"), "got: {}", err);
+}
+
+#[tokio::test]
+#[ignore = "requires dev docker postgres on :5433"]
+async fn staged_edits_apply_atomically() {
+    let pool = setup("_stg").await;
+    let table = "_bestgres_test_stg";
+    use bestgres_lib::models::CellEdit;
+
+    // Two valid edits on row 1 apply together
+    let edits = vec![
+        CellEdit {
+            column: "txt".into(),
+            primary_key_columns: vec!["id".into()],
+            primary_key_values: vec![json!(1)],
+            new_value: json!("batched"),
+        },
+        CellEdit {
+            column: "price".into(),
+            primary_key_columns: vec!["id".into()],
+            primary_key_values: vec![json!(1)],
+            new_value: json!("5.2500"),
+        },
+    ];
+    let n = postgres::apply_cell_edits(&pool, "public", table, &edits)
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
+
+    let res = postgres::execute_query(
+        &pool,
+        "SELECT txt, price FROM _bestgres_test_stg WHERE id = 1",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(res.rows[0][0], json!("batched"));
+    assert_eq!(res.rows[0][1], json!("5.2500"));
+
+    // preview produces SQL without executing
+    let preview = postgres::preview_cell_edits(&pool, "public", table, &edits)
+        .await
+        .unwrap();
+    assert!(preview.contains("UPDATE"));
+    assert_eq!(preview.lines().count(), 2);
+
+    // A batch where the second edit matches no row must roll back the first
+    let bad = vec![
+        CellEdit {
+            column: "txt".into(),
+            primary_key_columns: vec!["id".into()],
+            primary_key_values: vec![json!(1)],
+            new_value: json!("should_not_persist"),
+        },
+        CellEdit {
+            column: "txt".into(),
+            primary_key_columns: vec!["id".into()],
+            primary_key_values: vec![json!(999999)],
+            new_value: json!("x"),
+        },
+    ];
+    let err = postgres::apply_cell_edits(&pool, "public", table, &bad).await;
+    assert!(err.is_err());
+    let res = postgres::execute_query(
+        &pool,
+        "SELECT txt FROM _bestgres_test_stg WHERE id = 1",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        res.rows[0][0],
+        json!("batched"),
+        "first edit must have rolled back"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dev docker postgres on :5433"]
+async fn row_estimate_and_foreign_keys() {
+    let pool = setup("_est").await;
+    sqlx::query("ANALYZE _bestgres_test_est")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let est = postgres::get_row_estimate(&pool, "public", "_bestgres_test_est")
+        .await
+        .unwrap();
+    assert!(
+        est >= 0,
+        "estimate after ANALYZE should be >= 0, got {}",
+        est
+    );
+
+    // FK detection
+    sqlx::query("DROP TABLE IF EXISTS _bestgres_child_est")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE _bestgres_child_est (id serial PRIMARY KEY, parent int REFERENCES _bestgres_test_est(id))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let fks = postgres::get_foreign_keys(&pool, "public", "_bestgres_child_est")
+        .await
+        .unwrap();
+    assert_eq!(fks.len(), 1);
+    assert_eq!(fks[0].column_name, "parent");
+    assert_eq!(fks[0].ref_table, "_bestgres_test_est");
+    assert_eq!(fks[0].ref_column, "id");
+    sqlx::query("DROP TABLE _bestgres_child_est")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires dev docker postgres on :5433"]
+async fn streaming_emits_columns_and_chunks() {
+    let pool = setup("_strm").await;
+    use bestgres_lib::db::postgres::StreamEvent;
+    use std::sync::{Arc, Mutex};
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let row_total = Arc::new(Mutex::new(0usize));
+    let ev = events.clone();
+    let rt = row_total.clone();
+    let summary = postgres::execute_query_stream(
+        &pool,
+        "SELECT generate_series(1, 1200) AS n",
+        &[],
+        500,
+        move |e| {
+            match &e {
+                StreamEvent::Columns { columns } => ev
+                    .lock()
+                    .unwrap()
+                    .push(format!("cols:{}", columns.join(","))),
+                StreamEvent::Rows { rows } => *rt.lock().unwrap() += rows.len(),
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.row_count, 1200);
+    assert_eq!(*row_total.lock().unwrap(), 1200);
+    let evs = events.lock().unwrap();
+    assert_eq!(
+        evs.iter().filter(|s| s.starts_with("cols:")).count(),
+        1,
+        "exactly one Columns event"
+    );
 }

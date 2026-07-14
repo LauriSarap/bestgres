@@ -37,12 +37,11 @@ pub async fn test_connection(pool: &PgPool) -> Result<(), AppError> {
 
 /// List all non-template databases on the server.
 pub async fn list_databases(pool: &PgPool) -> Result<Vec<String>, AppError> {
-    let rows = sqlx::query(
-        "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let rows =
+        sqlx::query("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
     let dbs = rows.iter().map(|row| row.get("datname")).collect();
     Ok(dbs)
@@ -138,7 +137,7 @@ pub async fn get_table_structure(
     schema: &str,
     table: &str,
 ) -> Result<crate::models::TableStructure, AppError> {
-    use crate::models::{ColumnDetail, IndexInfo, ConstraintInfo, ForeignKeyInfo};
+    use crate::models::{ColumnDetail, ConstraintInfo, ForeignKeyInfo, IndexInfo};
 
     // 1. Detailed column info
     let col_rows = sqlx::query(
@@ -320,6 +319,71 @@ pub async fn get_table_structure(
     })
 }
 
+/// Get the planner's estimated row count for a table from pg_class.reltuples.
+/// Returns -1 if the table has never been analyzed (reltuples < 0 or unknown).
+/// This is instant even on huge tables, unlike COUNT(*).
+pub async fn get_row_estimate(pool: &PgPool, schema: &str, table: &str) -> Result<i64, AppError> {
+    let row = sqlx::query(
+        r#"
+        SELECT c.reltuples::bigint AS estimate
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(row.map(|r| r.get::<i64, _>("estimate")).unwrap_or(-1))
+}
+
+/// Get foreign key relationships for a table (which columns reference where).
+pub async fn get_foreign_keys(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<crate::models::ForeignKeyInfo>, AppError> {
+    use crate::models::ForeignKeyInfo;
+    let fk_rows = sqlx::query(
+        r#"
+        SELECT
+            con.conname AS name,
+            att.attname AS column_name,
+            ref_ns.nspname AS ref_schema,
+            ref_cl.relname AS ref_table,
+            ref_att.attname AS ref_column
+        FROM pg_constraint con
+        JOIN pg_class t ON t.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ANY(con.conkey)
+        JOIN pg_class ref_cl ON ref_cl.oid = con.confrelid
+        JOIN pg_namespace ref_ns ON ref_ns.oid = ref_cl.relnamespace
+        JOIN pg_attribute ref_att ON ref_att.attrelid = con.confrelid AND ref_att.attnum = ANY(con.confkey)
+        WHERE n.nspname = $1 AND t.relname = $2 AND con.contype = 'f'
+        ORDER BY con.conname, att.attnum
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(fk_rows
+        .iter()
+        .map(|row| ForeignKeyInfo {
+            name: row.get("name"),
+            column_name: row.get("column_name"),
+            ref_schema: row.get("ref_schema"),
+            ref_table: row.get("ref_table"),
+            ref_column: row.get("ref_column"),
+        })
+        .collect())
+}
+
 /// Get primary key column names for a table, in constraint order.
 /// Returns empty vec if the table has no primary key.
 pub async fn get_primary_key_columns(
@@ -393,11 +457,77 @@ async fn get_column_types(
 
 /// Build a `$N::type` placeholder. Without a known type the bare placeholder is
 /// bound as text, which only works for text-like columns.
-fn typed_placeholder(idx: u32, col: &str, types: &std::collections::HashMap<String, String>) -> String {
+fn typed_placeholder(
+    idx: u32,
+    col: &str,
+    types: &std::collections::HashMap<String, String>,
+) -> String {
     match types.get(col) {
         Some(t) => format!("${}::{}", idx, t),
         None => format!("${}", idx),
     }
+}
+
+/// Validate an edit's identifiers and PK column/value pairing.
+fn validate_edit(
+    schema: &str,
+    table: &str,
+    column: &str,
+    pk_columns: &[String],
+    pk_values: &[serde_json::Value],
+) -> Result<(), AppError> {
+    check_ident(schema)?;
+    check_ident(table)?;
+    check_ident(column)?;
+    if pk_columns.is_empty() {
+        return Err(AppError::Database(
+            "Table has no primary key; cannot update".into(),
+        ));
+    }
+    if pk_columns.len() != pk_values.len() {
+        return Err(AppError::Database(
+            "Primary key column/value count mismatch".into(),
+        ));
+    }
+    for pk_col in pk_columns {
+        check_ident(pk_col)?;
+    }
+    Ok(())
+}
+
+/// Build the parameterized UPDATE for one cell edit:
+/// `UPDATE "s"."t" SET "col" = $1::type WHERE "pk1" = $2::type AND ...`
+fn build_update_sql(
+    schema: &str,
+    table: &str,
+    column: &str,
+    pk_columns: &[String],
+    types: &std::collections::HashMap<String, String>,
+) -> String {
+    let set_clause = format!(
+        "{} = {}",
+        quote_ident(column),
+        typed_placeholder(1, column, types)
+    );
+    let where_clause = pk_columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            format!(
+                "{} = {}",
+                quote_ident(c),
+                typed_placeholder(i as u32 + 2, c, types)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "UPDATE {}.{} SET {} WHERE {}",
+        quote_ident(schema),
+        quote_ident(table),
+        set_clause,
+        where_clause
+    )
 }
 
 /// Update a single cell value. Values are bound as text and cast to the column's
@@ -411,47 +541,144 @@ pub async fn update_cell(
     primary_key_values: &[serde_json::Value],
     new_value: &serde_json::Value,
 ) -> Result<u64, AppError> {
-    check_ident(schema)?;
-    check_ident(table)?;
-    check_ident(column)?;
-    if primary_key_columns.is_empty() {
-        return Err(AppError::Database("Table has no primary key; cannot update".into()));
-    }
-    if primary_key_columns.len() != primary_key_values.len() {
-        return Err(AppError::Database("Primary key column/value count mismatch".into()));
-    }
-    for pk_col in primary_key_columns {
-        check_ident(pk_col)?;
-    }
+    validate_edit(
+        schema,
+        table,
+        column,
+        primary_key_columns,
+        primary_key_values,
+    )?;
 
     let types = get_column_types(pool, schema, table).await?;
-
-    // UPDATE "schema"."table" SET "column" = $1::type WHERE "pk1" = $2::type AND ...
-    let set_clause = format!("{} = {}", quote_ident(column), typed_placeholder(1, column, &types));
-    let where_clause = primary_key_columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("{} = {}", quote_ident(c), typed_placeholder(i as u32 + 2, c, &types)))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let sql = format!(
-        "UPDATE {}.{} SET {} WHERE {}",
-        quote_ident(schema),
-        quote_ident(table),
-        set_clause,
-        where_clause
-    );
+    let sql = build_update_sql(schema, table, column, primary_key_columns, &types);
 
     let mut q = sqlx::query(&sql).bind(serde_json_value_to_sql(new_value));
     for v in primary_key_values {
         q = q.bind(serde_json_value_to_sql(v));
     }
 
-    let result = q.execute(pool).await.map_err(|e| AppError::Database(e.to_string()))?;
+    let result = q
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     if result.rows_affected() == 0 {
-        return Err(AppError::Database("No row matched the primary key; nothing updated".into()));
+        return Err(AppError::Database(
+            "No row matched the primary key; nothing updated".into(),
+        ));
     }
     Ok(result.rows_affected())
+}
+
+/// Render a JSON value as a SQL literal for human-readable preview (NOT for
+/// execution — apply_cell_edits always binds parameters).
+fn json_to_sql_literal(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        other => format!("'{}'", other.to_string().replace('\'', "''")),
+    }
+}
+
+/// Build human-readable SQL for a set of edits, with values inlined.
+/// For display only — execution uses bound parameters.
+pub async fn preview_cell_edits(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+    edits: &[crate::models::CellEdit],
+) -> Result<String, AppError> {
+    let types = get_column_types(pool, schema, table).await?;
+    let mut lines = Vec::with_capacity(edits.len());
+    for e in edits {
+        validate_edit(
+            schema,
+            table,
+            &e.column,
+            &e.primary_key_columns,
+            &e.primary_key_values,
+        )?;
+        let cast = types
+            .get(&e.column)
+            .map(|t| format!("::{}", t))
+            .unwrap_or_default();
+        let set = format!(
+            "{} = {}{}",
+            quote_ident(&e.column),
+            json_to_sql_literal(&e.new_value),
+            cast
+        );
+        let where_clause = e
+            .primary_key_columns
+            .iter()
+            .zip(&e.primary_key_values)
+            .map(|(c, v)| {
+                let cc = types.get(c).map(|t| format!("::{}", t)).unwrap_or_default();
+                format!("{} = {}{}", quote_ident(c), json_to_sql_literal(v), cc)
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        lines.push(format!(
+            "UPDATE {}.{} SET {} WHERE {};",
+            quote_ident(schema),
+            quote_ident(table),
+            set,
+            where_clause
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Apply a batch of cell edits in a single transaction. Either all succeed or
+/// none do. Each edit must match exactly one row.
+pub async fn apply_cell_edits(
+    pool: &PgPool,
+    schema: &str,
+    table: &str,
+    edits: &[crate::models::CellEdit],
+) -> Result<u64, AppError> {
+    if edits.is_empty() {
+        return Ok(0);
+    }
+    let types = get_column_types(pool, schema, table).await?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let mut total = 0u64;
+    for (i, e) in edits.iter().enumerate() {
+        validate_edit(
+            schema,
+            table,
+            &e.column,
+            &e.primary_key_columns,
+            &e.primary_key_values,
+        )?;
+        let sql = build_update_sql(schema, table, &e.column, &e.primary_key_columns, &types);
+        let mut q = sqlx::query(&sql).bind(serde_json_value_to_sql(&e.new_value));
+        for v in &e.primary_key_values {
+            q = q.bind(serde_json_value_to_sql(v));
+        }
+        let result = q
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| AppError::Database(format!("Edit {} ({}): {}", i + 1, e.column, err)))?;
+        if result.rows_affected() == 0 {
+            // tx is dropped here → automatic rollback
+            return Err(AppError::Database(format!(
+                "Edit {} ({}): no row matched the primary key",
+                i + 1,
+                e.column
+            )));
+        }
+        total += result.rows_affected();
+    }
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(total)
 }
 
 /// Insert a new row. Values are bound as text and cast to each column's actual type.
@@ -495,7 +722,10 @@ pub async fn insert_row(
         q = q.bind(serde_json_value_to_sql(v));
     }
 
-    let result = q.execute(pool).await.map_err(|e| AppError::Database(e.to_string()))?;
+    let result = q
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(result.rows_affected())
 }
 
@@ -510,7 +740,9 @@ pub async fn delete_rows(
     check_ident(schema)?;
     check_ident(table)?;
     if primary_key_columns.is_empty() {
-        return Err(AppError::Database("Table has no primary key; cannot delete".into()));
+        return Err(AppError::Database(
+            "Table has no primary key; cannot delete".into(),
+        ));
     }
     for pk_col in primary_key_columns {
         check_ident(pk_col)?;
@@ -528,7 +760,9 @@ pub async fn delete_rows(
     let mut value_tuples = Vec::with_capacity(primary_key_values_list.len());
     for row_vals in primary_key_values_list {
         if row_vals.len() != primary_key_columns.len() {
-            return Err(AppError::Database("Primary key value count mismatch".into()));
+            return Err(AppError::Database(
+                "Primary key value count mismatch".into(),
+            ));
         }
         let placeholders: Vec<String> = primary_key_columns
             .iter()
@@ -557,7 +791,10 @@ pub async fn delete_rows(
         }
     }
 
-    let result = q.execute(pool).await.map_err(|e| AppError::Database(e.to_string()))?;
+    let result = q
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     Ok(result.rows_affected())
 }
 
@@ -675,7 +912,10 @@ fn format_interval(v: &sqlx::postgres::types::PgInterval) -> String {
     let secs = (total_secs % 60).abs();
     if v.microseconds != 0 || parts.is_empty() {
         if micros != 0 {
-            parts.push(format!("{:02}:{:02}:{:02}.{:06}", hours, mins, secs, micros));
+            parts.push(format!(
+                "{:02}:{:02}:{:02}.{:06}",
+                hours, mins, secs, micros
+            ));
         } else {
             parts.push(format!("{:02}:{:02}:{:02}", hours, mins, secs));
         }
@@ -731,6 +971,143 @@ pub async fn execute_query(
 
     result.execution_time_ms = start.elapsed().as_millis() as u64;
     Ok(result)
+}
+
+/// Cap on rows streamed to the frontend per result set. Higher than the
+/// buffered cap because chunks render progressively instead of all at once.
+pub const MAX_STREAM_ROWS: usize = 50_000;
+
+/// Progressive event emitted while streaming a query's results.
+#[derive(serde::Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamEvent {
+    /// A (new) result set started — frontend should reset its rows to these columns.
+    Columns { columns: Vec<String> },
+    /// A chunk of rows for the current result set.
+    Rows { rows: Vec<Vec<serde_json::Value>> },
+}
+
+/// Summary returned once streaming completes (rows already delivered via events).
+#[derive(serde::Serialize, Clone)]
+pub struct StreamSummary {
+    pub columns: Vec<String>,
+    pub row_count: usize,
+    pub rows_affected: u64,
+    pub truncated: bool,
+    pub execution_time_ms: u64,
+}
+
+/// Execute SQL, emitting columns and row chunks progressively via `emit` so the
+/// UI can render the first rows before the whole result set arrives. Supports
+/// multi-statement scripts (each result set re-emits Columns); the last result
+/// set is the one left displayed. Returns a summary once complete.
+pub async fn execute_query_stream<F>(
+    pool: &PgPool,
+    sql: &str,
+    params: &[serde_json::Value],
+    chunk_size: usize,
+    mut emit: F,
+) -> Result<StreamSummary, AppError>
+where
+    F: FnMut(StreamEvent) -> Result<(), AppError>,
+{
+    use futures_util::TryStreamExt;
+
+    let start = std::time::Instant::now();
+    let statements: Vec<String> = if params.is_empty() {
+        crate::db::sql_split::split_statements(sql)
+    } else {
+        vec![sql.to_string()]
+    };
+    if statements.is_empty() {
+        return Err(AppError::Database("Empty query".into()));
+    }
+    let total = statements.len();
+
+    let mut last_columns: Vec<String> = Vec::new();
+    let mut last_row_count = 0usize;
+    let mut last_was_resultset = false;
+    let mut total_affected = 0u64;
+    let mut truncated = false;
+
+    for (idx, stmt) in statements.iter().enumerate() {
+        let mut q = sqlx::query(stmt);
+        for p in params {
+            q = q.bind(serde_json_value_to_sql(p));
+        }
+
+        #[allow(deprecated)]
+        let mut stream = q.fetch_many(pool);
+
+        let mut columns: Vec<String> = Vec::new();
+        let mut emitted_columns = false;
+        let mut count = 0usize;
+        let mut buffer: Vec<Vec<serde_json::Value>> = Vec::with_capacity(chunk_size);
+        let mut stmt_truncated = false;
+        let mut stmt_affected = 0u64;
+
+        loop {
+            let item = stream.try_next().await.map_err(|e| {
+                if total > 1 {
+                    AppError::Database(format!("Statement {} of {}: {}", idx + 1, total, e))
+                } else {
+                    AppError::Database(e.to_string())
+                }
+            })?;
+            let Some(item) = item else { break };
+
+            match item {
+                sqlx::Either::Left(done) => stmt_affected += done.rows_affected(),
+                sqlx::Either::Right(row) => {
+                    if !emitted_columns {
+                        columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+                        emit(StreamEvent::Columns {
+                            columns: columns.clone(),
+                        })?;
+                        emitted_columns = true;
+                    }
+                    if count >= MAX_STREAM_ROWS {
+                        stmt_truncated = true;
+                        break;
+                    }
+                    buffer.push((0..columns.len()).map(|i| decode_cell(&row, i)).collect());
+                    count += 1;
+                    if buffer.len() >= chunk_size {
+                        emit(StreamEvent::Rows {
+                            rows: std::mem::take(&mut buffer),
+                        })?;
+                    }
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            emit(StreamEvent::Rows { rows: buffer })?;
+        }
+
+        if emitted_columns {
+            // A result set: its command-tag count is row count, not "affected"
+            last_columns = columns;
+            last_row_count = count;
+            last_was_resultset = true;
+            truncated = stmt_truncated;
+        } else {
+            // DML/DDL with no result set — its affected rows count
+            total_affected += stmt_affected;
+            if !last_was_resultset {
+                last_columns = Vec::new();
+                last_row_count = 0;
+                truncated = false;
+            }
+        }
+    }
+
+    Ok(StreamSummary {
+        columns: last_columns,
+        row_count: last_row_count,
+        rows_affected: total_affected,
+        truncated,
+        execution_time_ms: start.elapsed().as_millis() as u64,
+    })
 }
 
 /// Run a single statement, streaming rows so huge result sets don't exhaust

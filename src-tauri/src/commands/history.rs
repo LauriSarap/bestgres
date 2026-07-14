@@ -82,12 +82,29 @@ fn load_history_entries(path: &std::path::Path) -> Vec<HistoryEntry> {
 // ── Saved queries ──
 
 #[tauri::command]
-pub async fn save_query(id: String, name: String, sql: String, database: String) -> Result<(), AppError> {
+pub async fn save_query(
+    id: String,
+    name: String,
+    sql: String,
+    database: String,
+) -> Result<(), AppError> {
     let dir = queries_dir()?;
-    let entry = SavedQuery { id: id.clone(), name, sql, database };
+    let entry = SavedQuery {
+        id: id.clone(),
+        name,
+        sql,
+        database,
+    };
 
-    let safe_id: String = id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+    let safe_id: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path = dir.join(format!("{}.json", safe_id));
 
@@ -126,8 +143,15 @@ pub async fn list_saved_queries() -> Result<Vec<SavedQuery>, AppError> {
 #[tauri::command]
 pub async fn delete_saved_query(id: String) -> Result<(), AppError> {
     let dir = queries_dir()?;
-    let safe_id: String = id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+    let safe_id: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path = dir.join(format!("{}.json", safe_id));
 
