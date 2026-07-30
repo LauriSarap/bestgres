@@ -56,6 +56,18 @@ export function stringifyCell(value: unknown): string {
   return String(value);
 }
 
+export function formatInspectorValue(value: unknown): string {
+  if (value === null || value === undefined) return "NULL";
+  if (typeof value === "object") return JSON.stringify(value, null, 2);
+  if (typeof value !== "string") return String(value);
+
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2);
+  } catch {
+    return value;
+  }
+}
+
 function rowToObject(columns: GridColumn[], row: unknown[]): Record<string, unknown> {
   const obj: Record<string, unknown> = {};
   columns.forEach((c, i) => (obj[c.name] = row[i]));

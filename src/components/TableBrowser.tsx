@@ -5,7 +5,7 @@ import {
   Loader2, AlertCircle, Clock, Rows3, Plus, Trash2, Filter, X, Check,
   Download, PanelBottom, Ban, Save, Undo2, Zap, RefreshCw, Copy,
 } from "lucide-react";
-import { DataGrid, formatRows, stringifyCell } from "@/components/DataGrid";
+import { DataGrid, formatInspectorValue, formatRows } from "@/components/DataGrid";
 import { parseEditValue } from "@/components/EditableCell";
 import { useToast } from "@/components/Toast";
 import { useTableData } from "@/hooks/use-table-data";
@@ -168,17 +168,16 @@ export function TableBrowser({
 
   /* ── Inspector ── */
   const handleFocusCell = useCallback((r: number, c: number) => {
+    const value = t.rows[r]?.[c];
     setFocusedCell({ r, c });
-    setInspectorDraft(stringifyCell(t.rows[r]?.[c]) === "NULL" ? "" : stringifyCell(t.rows[r]?.[c]));
+    setInspectorDraft(value === null || value === undefined ? "" : formatInspectorValue(value));
   }, [t.rows]);
 
   const focusedValue = focusedCell ? t.rows[focusedCell.r]?.[focusedCell.c] : undefined;
   const focusedColEditable = focusedCell ? t.gridColumns[focusedCell.c]?.editable : false;
 
   const prettyInspector = useMemo(() => {
-    if (focusedValue === null || focusedValue === undefined) return "NULL";
-    const s = String(focusedValue);
-    try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; }
+    return formatInspectorValue(focusedValue);
   }, [focusedValue]);
 
   const saveInspector = useCallback(() => {

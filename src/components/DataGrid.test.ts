@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { formatRows, stringifyCell, type GridColumn } from "./DataGrid";
+import {
+  formatInspectorValue,
+  formatRows,
+  stringifyCell,
+  type GridColumn,
+} from "./DataGrid";
 
 const columns: GridColumn[] = [{ name: "name" }, { name: "payload" }];
 const rows = [["Alice, \"A\"", { active: true }], [null, "a|b"]];
@@ -9,6 +14,17 @@ describe("DataGrid serialization", () => {
     expect(stringifyCell(null)).toBe("NULL");
     expect(stringifyCell({ active: true })).toBe('{"active":true}');
     expect(stringifyCell(42)).toBe("42");
+  });
+
+  it("pretty-prints object and string-encoded JSON for the inspector", () => {
+    expect(formatInspectorValue({ profile: { name: "Ada" }, active: true })).toBe(
+      '{\n  "profile": {\n    "name": "Ada"\n  },\n  "active": true\n}'
+    );
+    expect(formatInspectorValue('{"items":[1,2]}')).toBe(
+      '{\n  "items": [\n    1,\n    2\n  ]\n}'
+    );
+    expect(formatInspectorValue("ordinary text")).toBe("ordinary text");
+    expect(formatInspectorValue(null)).toBe("NULL");
   });
 
   it("escapes CSV fields and quotes", () => {
