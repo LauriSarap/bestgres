@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import {
@@ -7,6 +7,15 @@ import {
 } from "lucide-react";
 import { DataGrid, formatInspectorValue, formatRows } from "@/components/DataGrid";
 import { parseEditValue } from "@/components/EditableCell";
+import {
+  clampInspectorHeight,
+  INSPECTOR_HEIGHT_KEY,
+  INSPECTOR_MIN_HEIGHT,
+  INSPECTOR_RESIZE_STEP,
+  maxInspectorHeight,
+  readInspectorHeight,
+  resizedInspectorHeight,
+} from "@/components/inspector-layout";
 import { useToast } from "@/components/Toast";
 import { useTableData } from "@/hooks/use-table-data";
 
@@ -37,6 +46,14 @@ export function TableBrowser({
   const [showInspector, setShowInspector] = useState(false);
   const [focusedCell, setFocusedCell] = useState<{ r: number; c: number } | null>(null);
   const [inspectorDraft, setInspectorDraft] = useState("");
+  const [inspectorHeight, setInspectorHeight] = useState(() =>
+    readInspectorHeight(localStorage, window.innerHeight)
+  );
+  const inspectorResize = useRef<{
+    pointerId: number;
+    startY: number;
+    startHeight: number;
+  } | null>(null);
   const [previewSql, setPreviewSql] = useState<string | null>(null);
   const [applying, setApplying] = useState(false);
 
@@ -184,6 +201,34 @@ export function TableBrowser({
     if (!focusedCell) return;
     handleEditCommit(focusedCell.r, focusedCell.c, parseEditValue(inspectorDraft));
   }, [focusedCell, inspectorDraft, handleEditCommit]);
+
+  useEffect(() => {
+    localStorage.setItem(INSPECTOR_HEIGHT_KEY, String(inspectorHeight));
+  }, [inspectorHeight]);
+
+  useEffect(() => {
+    const clampToViewport = () => {
+      setInspectorHeight((height) => clampInspectorHeight(height, window.innerHeight));
+    };
+    window.addEventListener("resize", clampToViewport);
+    return () => window.removeEventListener("resize", clampToViewport);
+  }, []);
+
+  const handleInspectorResizeKey = useCallback((e: React.KeyboardEvent) => {
+    let nextHeight: ((height: number) => number) | null = null;
+    if (e.key === "ArrowUp") {
+      nextHeight = (height) => height + INSPECTOR_RESIZE_STEP;
+    } else if (e.key === "ArrowDown") {
+      nextHeight = (height) => height - INSPECTOR_RESIZE_STEP;
+    } else if (e.key === "Home") {
+      nextHeight = () => INSPECTOR_MIN_HEIGHT;
+    } else if (e.key === "End") {
+      nextHeight = () => maxInspectorHeight(window.innerHeight);
+    }
+    if (!nextHeight) return;
+    e.preventDefault();
+    setInspectorHeight((height) => clampInspectorHeight(nextHeight(height), window.innerHeight));
+  }, []);
 
   /* ── Export ── */
   const handleExport = useCallback(async (format: "csv" | "json") => {
@@ -399,7 +444,52 @@ export function TableBrowser({
 
       {/* Cell inspector */}
       {showInspector && (
-        <div className="flex h-48 shrink-0 flex-col border-t border-border bg-muted/20">
+        <div
+          className="flex shrink-0 flex-col bg-muted/20"
+          style={{ height: inspectorHeight }}
+        >
+          <div
+            role="separator"
+            aria-label="Resize cell inspector"
+            aria-orientation="horizontal"
+            aria-valuemin={INSPECTOR_MIN_HEIGHT}
+            aria-valuemax={maxInspectorHeight(window.innerHeight)}
+            aria-valuenow={inspectorHeight}
+            tabIndex={0}
+            title="Drag to resize the cell inspector"
+            className="group relative h-2 shrink-0 cursor-row-resize touch-none border-t border-border focus:outline-none focus:ring-1 focus:ring-inset focus:ring-primary"
+            onPointerDown={(e) => {
+              inspectorResize.current = {
+                pointerId: e.pointerId,
+                startY: e.clientY,
+                startHeight: inspectorHeight,
+              };
+              e.currentTarget.setPointerCapture(e.pointerId);
+            }}
+            onPointerMove={(e) => {
+              const start = inspectorResize.current;
+              if (!start || start.pointerId !== e.pointerId) return;
+              setInspectorHeight(
+                resizedInspectorHeight(
+                  start.startHeight,
+                  start.startY,
+                  e.clientY,
+                  window.innerHeight
+                )
+              );
+            }}
+            onPointerUp={(e) => {
+              if (inspectorResize.current?.pointerId !== e.pointerId) return;
+              inspectorResize.current = null;
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            }}
+            onPointerCancel={() => {
+              inspectorResize.current = null;
+            }}
+            onKeyDown={handleInspectorResizeKey}
+          >
+            <span className="absolute left-1/2 top-1/2 h-0.5 w-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-border transition-colors group-hover:bg-primary/60" />
+          </div>
           <div className="flex items-center justify-between border-b border-border px-3 py-1 text-[11px] text-muted-foreground">
             <span className="font-medium">
               {focusedCell ? `${t.columnNames[focusedCell.c]} (${t.gridColumns[focusedCell.c]?.type ?? "?"})` : "Cell inspector — click a cell"}
