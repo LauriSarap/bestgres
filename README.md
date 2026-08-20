@@ -2,6 +2,8 @@
 
 A fast, minimal PostgreSQL client built with Tauri v2, React, and Rust.
 
+![Bestgres table browser](docs/screenshots/table-browser.png)
+
 ## Features
 
 **Connections** — Add, edit, remove connections with keychain password storage. Auto-saved to `~/.config/bestgres/`. Health indicator per connection. Multi-database support with pool reuse.
