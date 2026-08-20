@@ -8,6 +8,8 @@ A fast, minimal PostgreSQL client built with Tauri v2, React, and Rust.
 
 **Connections** — Add, edit, remove connections with keychain password storage. Auto-saved to `~/.config/bestgres/`. Health indicator per connection. Multi-database support with pool reuse.
 
+![New connection dialog](docs/screenshots/new-connection.png)
+
 **Schema browser** — Sidebar tree (Connection > Database > Tables/Views). Table structure view with columns, indexes, constraints, and foreign keys.
 
 **Table browser** — Paginated data view with virtualized scrolling. Inline cell editing, row insert/delete, column sorting and filtering. Right-click to copy cell or row as JSON.
