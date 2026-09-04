@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 - 2026-09-03
+
+- Table browser fetches large json/jsonb/text/bytea cells as capped previews so pages stay fast on tables with multi-megabyte values; clicking a truncated cell opens the inspector and loads the full value by primary key.
+
 ## 0.3.0 - 2026-07-14
 
 - Persist Linux connection credentials across restarts using Secret Service, while keeping saved connection metadata visible when a credential is missing.
