@@ -3,6 +3,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
 import { parseEditValue } from "@/components/EditableCell";
 import { Copy, ClipboardList, Ban, ExternalLink } from "lucide-react";
+import { isTruncated } from "@/lib/truncated-value";
 
 export interface GridColumn {
   name: string;
@@ -52,12 +53,14 @@ const ROW_H = 28;
 
 export function stringifyCell(value: unknown): string {
   if (value === null || value === undefined) return "NULL";
+  if (isTruncated(value)) return `${value.preview}…`;
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
 }
 
 export function formatInspectorValue(value: unknown): string {
   if (value === null || value === undefined) return "NULL";
+  if (isTruncated(value)) return `${value.preview}…`;
   if (typeof value === "object") return JSON.stringify(value, null, 2);
   if (typeof value !== "string") return String(value);
 
@@ -170,6 +173,8 @@ export const DataGrid = React.memo(function DataGrid({
   const startEdit = useCallback(
     (r: number, c: number) => {
       if (readOnly || !onEditCommit || !columns[c]?.editable) return;
+      // A truncated preview must not be written back; edit it via the inspector.
+      if (isTruncated(rows[r]?.[c])) return;
       setEditValue(stringifyCell(rows[r]?.[c]) === "NULL" ? "" : stringifyCell(rows[r]?.[c]));
       setEditing({ r, c });
     },
@@ -387,7 +392,13 @@ export const DataGrid = React.memo(function DataGrid({
                         pending && "bg-yellow-400/20"
                       )}
                       style={{ width: widths[ci] ?? DEFAULT_COL_W, height: ROW_H }}
-                      title={isNull ? undefined : stringifyCell(displayVal)}
+                      title={
+                        isNull
+                          ? undefined
+                          : isTruncated(displayVal)
+                            ? "Large value — click to load it in the inspector"
+                            : stringifyCell(displayVal)
+                      }
                       onMouseDown={() => focusCell(ri, ci)}
                       onDoubleClick={() => startEdit(ri, ci)}
                       onContextMenu={(e) => {

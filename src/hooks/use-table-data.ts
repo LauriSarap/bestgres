@@ -2,8 +2,73 @@ import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { QueryResult, ColumnInfo, ForeignKeyInfo, CellEdit } from "@/types";
 import type { GridColumn } from "@/components/DataGrid";
+import { TruncatedValue } from "@/lib/truncated-value";
 
 export const PAGE_SIZE = 200;
+
+/**
+ * Per-cell preview cap for the table browser. Columns of a type that can hold
+ * arbitrarily large values are selected as `left(col::text, cap + 1)` so a
+ * page of 200 rows stays small even when the table holds multi-megabyte JSON
+ * blobs. A value that comes back longer than the cap is marked as a
+ * TruncatedValue; the inspector fetches the full value by primary key.
+ */
+export const MAX_CELL_CHARS = 2048;
+
+const WIDE_TYPES = new Set([
+  "json",
+  "jsonb",
+  "text",
+  "character varying",
+  "bytea",
+  "xml",
+  "tsvector",
+  "USER-DEFINED",
+]);
+
+/** Column names (in table order) whose values are fetched as capped previews. */
+export function wideColumns(columns: Iterable<[name: string, dataType: string]>, pkCols: string[]): Set<string> {
+  const wide = new Set<string>();
+  for (const [name, type] of columns) {
+    if (WIDE_TYPES.has(type) && !pkCols.includes(name)) wide.add(name);
+  }
+  return wide;
+}
+
+/**
+ * SELECT list with wide columns capped server-side. Output aliases keep the
+ * original names so ORDER BY and the result's column list are unchanged.
+ * Falls back to `*` when column metadata is unavailable.
+ */
+export function buildSelectList(columns: Iterable<[name: string, dataType: string]>, pkCols: string[]): string {
+  const cols = [...columns];
+  if (cols.length === 0) return "*";
+  const wide = wideColumns(cols, pkCols);
+  return cols
+    .map(([name]) =>
+      wide.has(name)
+        ? `left(${quoteIdent(name)}::text, ${MAX_CELL_CHARS + 1}) AS ${quoteIdent(name)}`
+        : quoteIdent(name)
+    )
+    .join(", ");
+}
+
+/** Replace over-cap previews in wide columns with TruncatedValue markers. */
+export function markTruncated(rows: unknown[][], columnNames: string[], wide: Set<string>): unknown[][] {
+  const wideIdx = columnNames.flatMap((c, i) => (wide.has(c) ? [i] : []));
+  if (wideIdx.length === 0) return rows;
+  return rows.map((row) => {
+    let out = row;
+    for (const i of wideIdx) {
+      const v = row[i];
+      if (typeof v === "string" && v.length > MAX_CELL_CHARS) {
+        if (out === row) out = [...row];
+        out[i] = new TruncatedValue(v.slice(0, MAX_CELL_CHARS));
+      }
+    }
+    return out;
+  });
+}
 
 export type SortDirection = "asc" | "desc" | null;
 
@@ -116,10 +181,23 @@ export function useTableData({
     [connectionId, database]
   );
 
-  const fetchFirstPage = useCallback((): Promise<QueryResult> => {
+  const selectList = useMemo(
+    () => buildSelectList(columnTypes, primaryKeyColumns),
+    [columnTypes, primaryKeyColumns]
+  );
+  const wideCols = useMemo(
+    () => wideColumns(columnTypes, primaryKeyColumns),
+    [columnTypes, primaryKeyColumns]
+  );
+
+  const fetchFirstPage = useCallback(async (): Promise<QueryResult> => {
     const where = buildWhere();
-    return runQuery(`SELECT * FROM ${tableRef}${where.clause}${orderClause()} LIMIT ${PAGE_SIZE}`, where.params);
-  }, [tableRef, buildWhere, orderClause, runQuery]);
+    const res = await runQuery(
+      `SELECT ${selectList} FROM ${tableRef}${where.clause}${orderClause()} LIMIT ${PAGE_SIZE}`,
+      where.params
+    );
+    return { ...res, rows: markTruncated(res.rows, res.columns, wideCols) as QueryResult["rows"] };
+  }, [tableRef, selectList, wideCols, buildWhere, orderClause, runQuery]);
 
   const fetchExactCount = useCallback((): Promise<QueryResult> => {
     const where = buildWhere();
@@ -159,14 +237,15 @@ export function useTableData({
         const order = pkCols.length > 0
           ? ` ORDER BY ${pkCols.map((c) => `${quoteIdent(c)} ASC`).join(", ")}`
           : "";
+        const colEntries: [string, string][] = colInfo.map((c) => [c.name, c.data_type]);
         const dataRes = await invoke<QueryResult>("execute_query", {
           connectionId,
           database,
-          sql: `SELECT * FROM ${tableRef}${order} LIMIT ${PAGE_SIZE}`,
+          sql: `SELECT ${buildSelectList(colEntries, pkCols)} FROM ${tableRef}${order} LIMIT ${PAGE_SIZE}`,
         });
         if (cancelled) return;
         setColumnNames(dataRes.columns);
-        setRows(dataRes.rows);
+        setRows(markTruncated(dataRes.rows, dataRes.columns, wideColumns(colEntries, pkCols)));
         setReachedEnd(dataRes.rows.length < PAGE_SIZE);
         setExecTime(dataRes.execution_time_ms);
 
@@ -243,21 +322,22 @@ export function useTableData({
         const ksParams = [...where.params, String(lastPk)];
         const cmp = `${quoteIdent(pkCol)} > $${ksParams.length}::${pkType}`;
         const ksClause = where.clause ? `${where.clause} AND ${cmp}` : ` WHERE ${cmp}`;
-        res = await runQuery(`SELECT * FROM ${tableRef}${ksClause}${orderClause()} LIMIT ${PAGE_SIZE}`, ksParams);
+        res = await runQuery(`SELECT ${selectList} FROM ${tableRef}${ksClause}${orderClause()} LIMIT ${PAGE_SIZE}`, ksParams);
       } else {
         res = await runQuery(
-          `SELECT * FROM ${tableRef}${where.clause}${orderClause()} LIMIT ${PAGE_SIZE} OFFSET ${rows.length}`,
+          `SELECT ${selectList} FROM ${tableRef}${where.clause}${orderClause()} LIMIT ${PAGE_SIZE} OFFSET ${rows.length}`,
           where.params
         );
       }
       if (res.rows.length < PAGE_SIZE) setReachedEnd(true);
-      setRows((prev) => [...prev, ...res.rows]);
+      const nextRows = markTruncated(res.rows, res.columns, wideCols);
+      setRows((prev) => [...prev, ...nextRows]);
     } catch (err) {
       setError(String(err));
     } finally {
       setLoadingMore(false);
     }
-  }, [loadingMore, reachedEnd, buildWhere, canKeyset, pkType, rows, primaryKeyColumns, columnNames, tableRef, orderClause, runQuery]);
+  }, [loadingMore, reachedEnd, buildWhere, canKeyset, pkType, rows, primaryKeyColumns, columnNames, tableRef, selectList, wideCols, orderClause, runQuery]);
 
   const loadExactCount = useCallback(async () => {
     try {
@@ -310,6 +390,34 @@ export function useTableData({
         return i >= 0 ? rows[rowIndex][i] ?? null : null;
       }),
     [primaryKeyColumns, columnNames, rows]
+  );
+
+  /** Fetch the untruncated value of one cell by primary key. */
+  const fetchFullCell = useCallback(
+    async (rowIndex: number, colIndex: number): Promise<unknown> => {
+      if (primaryKeyColumns.length === 0) {
+        throw new Error("Table has no primary key; the full value cannot be fetched");
+      }
+      const params: string[] = [];
+      const pkValues = pkValuesForRow(rowIndex);
+      const conds = primaryKeyColumns.map((pk, i) => {
+        const v = pkValues[i];
+        params.push(typeof v === "object" ? JSON.stringify(v) : String(v));
+        const type = columnTypes.get(pk);
+        // Params bind as text; cast back to the column type so the PK index is
+        // usable. Enum/array PKs aren't safely castable, so compare as text.
+        return type && type !== "USER-DEFINED" && type !== "ARRAY"
+          ? `${quoteIdent(pk)} = $${params.length}::${type}`
+          : `${quoteIdent(pk)}::text = $${params.length}`;
+      });
+      const res = await runQuery(
+        `SELECT ${quoteIdent(columnNames[colIndex])} FROM ${tableRef} WHERE ${conds.join(" AND ")} LIMIT 1`,
+        params
+      );
+      if (res.rows.length === 0) throw new Error("Row no longer exists");
+      return res.rows[0][0];
+    },
+    [primaryKeyColumns, pkValuesForRow, columnTypes, columnNames, tableRef, runQuery]
   );
 
   /* ── Staged edits ── */
@@ -465,6 +573,7 @@ export function useTableData({
     refresh,
     getRowKey,
     canEdit,
+    fetchFullCell,
     // staged edits
     pendingEdits,
     pendingCount: pendingEdits.size,

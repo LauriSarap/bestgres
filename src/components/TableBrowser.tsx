@@ -18,6 +18,7 @@ import {
 } from "@/components/inspector-layout";
 import { useToast } from "@/components/Toast";
 import { useTableData } from "@/hooks/use-table-data";
+import { isTruncated } from "@/lib/truncated-value";
 
 interface TableBrowserProps {
   connectionId: string;
@@ -46,6 +47,10 @@ export function TableBrowser({
   const [showInspector, setShowInspector] = useState(false);
   const [focusedCell, setFocusedCell] = useState<{ r: number; c: number } | null>(null);
   const [inspectorDraft, setInspectorDraft] = useState("");
+  // Full value of a truncated cell, fetched by primary key when focused.
+  const [fullCell, setFullCell] = useState<
+    { r: number; c: number; status: "loading" } | { r: number; c: number; status: "ready"; value: unknown } | { r: number; c: number; status: "error"; message: string } | null
+  >(null);
   const [inspectorHeight, setInspectorHeight] = useState(() =>
     readInspectorHeight(localStorage, window.innerHeight)
   );
@@ -187,15 +192,43 @@ export function TableBrowser({
   const handleFocusCell = useCallback((r: number, c: number) => {
     const value = t.rows[r]?.[c];
     setFocusedCell({ r, c });
-    setInspectorDraft(value === null || value === undefined ? "" : formatInspectorValue(value));
-  }, [t.rows]);
+    if (!isTruncated(value)) {
+      setFullCell(null);
+      setInspectorDraft(value === null || value === undefined ? "" : formatInspectorValue(value));
+      return;
+    }
+    // Large value: show the inspector and load the untruncated value on demand.
+    setShowInspector(true);
+    setInspectorDraft("");
+    setFullCell({ r, c, status: "loading" });
+    t.fetchFullCell(r, c).then(
+      (full) => {
+        setFullCell((cur) => (cur && cur.r === r && cur.c === c ? { r, c, status: "ready", value: full } : cur));
+        setInspectorDraft(full === null || full === undefined ? "" : formatInspectorValue(full));
+      },
+      (err) => {
+        setFullCell((cur) => (cur && cur.r === r && cur.c === c ? { r, c, status: "error", message: String(err) } : cur));
+      }
+    );
+  }, [t.rows, t.fetchFullCell]);
 
-  const focusedValue = focusedCell ? t.rows[focusedCell.r]?.[focusedCell.c] : undefined;
-  const focusedColEditable = focusedCell ? t.gridColumns[focusedCell.c]?.editable : false;
+  const fullCellForFocused =
+    fullCell && focusedCell && fullCell.r === focusedCell.r && fullCell.c === focusedCell.c ? fullCell : null;
+  const focusedValue = fullCellForFocused?.status === "ready"
+    ? fullCellForFocused.value
+    : focusedCell ? t.rows[focusedCell.r]?.[focusedCell.c] : undefined;
+  const focusedValueLoading = fullCellForFocused?.status === "loading";
+  const focusedColEditable = focusedCell
+    ? !!t.gridColumns[focusedCell.c]?.editable && !focusedValueLoading && fullCellForFocused?.status !== "error"
+    : false;
 
   const prettyInspector = useMemo(() => {
+    if (fullCellForFocused?.status === "loading") return "Loading full value…";
+    if (fullCellForFocused?.status === "error") {
+      return `${formatInspectorValue(focusedValue)}\n\n[truncated — full value unavailable: ${fullCellForFocused.message}]`;
+    }
     return formatInspectorValue(focusedValue);
-  }, [focusedValue]);
+  }, [focusedValue, fullCellForFocused]);
 
   const saveInspector = useCallback(() => {
     if (!focusedCell) return;

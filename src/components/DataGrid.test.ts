@@ -48,3 +48,13 @@ describe("DataGrid serialization", () => {
     expect(formatRows(columns, [["a,b", "x"]], "tsv")).toBe("name\tpayload\na,b\tx");
   });
 });
+
+import { TruncatedValue } from "@/lib/truncated-value";
+
+describe("truncated cells", () => {
+  it("renders the preview with an ellipsis instead of serializing the marker", () => {
+    const v = new TruncatedValue('{"type":"Poly');
+    expect(stringifyCell(v)).toBe('{"type":"Poly…');
+    expect(formatInspectorValue(v)).toBe('{"type":"Poly…');
+  });
+});
